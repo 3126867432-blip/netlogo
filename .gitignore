@@ -1,0 +1,49 @@
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python cache
+__pycache__/
+*.pyc
+
+# NetLogo temporary / export outputs
+*.csv
+*.tmp
+*.bak
+
+# Archive files
+*.zip
+*.7z
+*.rar
+
+# Large local datasets (adjust as needed)
+data/
+datasets/
+input_data/
+output/
+outputs/
+results/
+figures/
+
+# Local GIS / raster data
+*.asc
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qmd
+*.tif
+*.tiff
+
+# Local environment-specific files
+.env
+.env.*

@@ -1,0 +1,3031 @@
+extensions [gis table]
+
+globals [
+roads
+  buildings
+  office-buildings
+  metro-stations
+  office-commuters-map
+  current-time-index
+  time-slots
+  current-time-slot
+  shadow-data
+  zone-data  ;; site boundary (zone) polygon dataset
+  zone-path  ;; zone shapefile path (site boundary)
+  shadow-date-string  ;; fixed shadow file date (YYYYMMDD)
+  shadow-buffer-m            ;; shadow buffer distance (meters, recommended 10)
+  plant-shadow-raster        ;; binary plant-shade raster (greensp_binary.asc)
+  plant-shadow-loaded?       ;; whether the plant-shade raster was loaded successfully
+  ;; --- coordinate scale (auto-detect projected meters / WGS84 degrees)---
+  gis-unit-per-patch         ;; meters represented by 1 NetLogo world unit (=1 patch)
+  gis-unit-per-patch-x       ;; X direction: meters per world unit
+  gis-unit-per-patch-y       ;; Y direction: meters per world unit
+  coords-are-degrees?        ;; whether roads data looks like lon/lat (WGS84), for scale conversion
+  walk-speed-mps             ;; walking speed (m/s), used for travel time estimation (default 1.5)
+  node-merge-tol-m           ;; vertex merge tolerance during network construction (meters)
+  shadow-sample-step-m       ;; sampling step for link shadow coverage (meters, default 5)
+  shadow-sample-max-n        ;; maximum number of shadow samples per link (performance control, default 25)
+  utci-fill-value            ;; UTCI fallback value for NoData nodes
+  utci-impute-max-radius-m   ;; maximum spatial interpolation radius for UTCI (meters, default 50)
+  utci-impute-step-m         ;; spatial interpolation step for UTCI (meters, default 10)
+  daylight-time-slots        ;; time slots treated as daylight
+  current-utci-dataset
+  simulation-phase
+  min-utci
+  max-utci
+  utci-data-loaded?
+
+  ; the next two lines are newly added
+  utci-base-dir
+  utci-file-map
+
+  ; --- active path selection parameters (multi-candidate + budget constraints) ---
+  comfort-dist-budget-mult         ;; distance budget multiplier (default 1.05 = +5%)
+  comfort-time-budget-mult         ;; time budget multiplier (default 1.05 = +5%)
+  comfort-time-budget-add          ;; additional time budget in seconds (default 60)
+  comfort-utci-improve-eps         ;; minimum average UTCI improvement needed to switch (default 0.05 C)
+  comfort-utci-ref                 ;; reference UTCI used for normalization (default 35)
+  ;; candidate weight sets: each item is [wDist wHeat wShade]
+  comfort-weight-sets
+  station-node-map
+  office-node-map
+  comfort-candidate-count          ;; candidate count (= length comfort-weight-sets)
+  ;; --- active path selection: thermal discomfort parameters ---
+  daylight?                      ;; whether it is daytime, used to decide whether sun exposure penalty applies
+  utci-discomfort-threshold      ;; threshold for thermal discomfort accumulation (UTCI above this starts accumulating discomfort)
+  utci-discomfort-alpha          ;; discomfort penalty strength used in discomfort-cost routing
+  utci-discomfort-power          ;; discomfort exponent (>1 emphasizes hotspots)
+  sun-penalty-alpha              ;; sun exposure penalty (increases discomfort when unshaded)
+  shadow-exposure-gamma         ;; exponent for sun penalty by exposure level
+  sun-altitude-deg              ;; solar altitude angle for the current slot (deg, <=0 means night)
+  sun-azimuth-deg               ;; solar azimuth for the current slot (deg, optional)
+  od-connect-max-n              ;; number of nearest network nodes used to connect an OD access node
+  od-connect-radius-m           ;; maximum connection radius for OD access nodes (meters)
+  comfort-discomfort-improve-ratio ;; required discomfort improvement ratio for switching paths
+  comfort-discomfort-improve-abs   ;; required absolute discomfort improvement for switching paths
+  comfort-heat-detour-per-deg      ;; extra detour multiplier allowed per 1 C increase in average UTCI
+  comfort-detour-max-mult          ;; maximum detour multiplier cap
+
+  ; --- experiment switches for separating shadow vs UTCI effects (counterfactual/ablation)---
+  use-shadow?                   ;; whether shadow effects are enabled
+  use-utci?                     ;; whether UTCI effects are enabled
+  scenario-id                   ;; scenario id: S0(all on) S1(no shadow) S2(no UTCI) S3(all off)
+  detour-max-effective          ;; effective detour-max used for active selection (for export/reproducibility)
+
+]
+breed [nodes node]
+breed [commuters commuter]
+breed [marks mark]
+breed [shadows shadow]
+
+
+patches-own [
+  shadow-buffered?
+]
+nodes-own [
+xcoord
+  ycoord
+  node-dist
+  node-prev
+  visited?
+  shadow-value
+  utci-value
+  utci-valid?  ;; UTCI(NoData)
+  utci-imputed? ;; /UTCI( vs )
+  time-slots-values
+  comp-id
+  access-node?   ;;  OD (/)
+  access-kind    ;; "station" / "office"
+  access-key     ;;  metro-no  office-no(/)
+]
+links-own [
+  link-weight
+  shadow-weight
+  shadow-cost
+  utci-weight
+  utci-cost
+  discomfort-excess
+  discomfort-cost
+  solar-weight
+  combined-weight
+  time-weights
+]
+
+commuters-own [
+  commuter-path
+  path-index
+  commuter-start-node
+  commuter-end-node
+
+  ;; --- (, GIS feature ) ---
+  metro-x
+  metro-y
+  office-x
+  office-y
+  metro-no
+  office-no
+
+  ;; --- OD(/ time-slot ) ---
+  start-x
+  start-y
+  end-x
+  end-y
+  od-valid?
+
+  ;; --- ("") ---
+  trip-dir      ;; "to_work" / "to_home"
+  light-class   ;; "daylight" / "night"
+
+  office-id
+  metro-id
+  status
+  current-time
+  path-types
+  shortest-path
+  min-utci-path
+  min-shadow-path
+  current-path-type
+  total-utci-exposure
+  total-shadow-exposure
+  travel-time
+  distance-traveled
+
+  ;; --- Individual heterogeneity parameters ---
+  personal-walk-speed-mps
+  departure-delay-sec
+  departure-delay-ticks
+  personal-utci-threshold
+  pref-dist
+  pref-heat
+  pref-shade
+  personal-path-type
+]
+
+; ================== utility functions ==================
+to-report safe-xy [thing]
+  if (is-list? thing and length thing = 2) [ report thing ]
+  let loc gis:location-of thing
+  if (is-list? loc and length loc = 2) [ report loc ]
+  report nobody
+end
+
+; ====== scale / distance / shadow sampling / UTCI imputation ======
+
+to-report distance-m [x1 y1 x2 y2]
+  ;; convert NetLogo world-coordinate differences to meters
+  ;;  update-gis-scale  gis-unit-per-patch-x / y
+  if (not is-number? gis-unit-per-patch-x) or (gis-unit-per-patch-x <= 0) [
+    update-gis-scale
+  ]
+  let dx_ (x1 - x2)
+  let dy_ (y1 - y2)
+  report sqrt ((dx_ * gis-unit-per-patch-x) ^ 2 + (dy_ * gis-unit-per-patch-y) ^ 2)
+end
+
+to-report shadow-fraction-between [x1 y1 x2 y2]
+  ;; compute the fraction of a segment covered by shadow-buffer patches (0-1)
+  ;; daytime: sample shadow-buffered patches; night: return 1
+  if not daylight? [ report 1 ]
+  if shadow-data = nobody [ report 0 ]
+
+  if (not is-number? shadow-sample-step-m) or (shadow-sample-step-m <= 0) [ set shadow-sample-step-m 5 ]
+  if (not is-number? shadow-sample-max-n) or (shadow-sample-max-n < 5) [ set shadow-sample-max-n 25 ]
+
+  let segLenM distance-m x1 y1 x2 y2
+  if segLenM <= 0 [ report 0 ]
+
+  let n floor (segLenM / shadow-sample-step-m)
+  if n < 1 [ set n 1 ]
+  if n > shadow-sample-max-n [ set n shadow-sample-max-n ]
+
+  let dx_ (x2 - x1)
+  let dy_ (y2 - y1)
+
+  let shaded 0
+  let i 0
+  while [ i <= n ] [
+    let t (i / n)
+    let xs (x1 + dx_ * t)
+    let ys (y1 + dy_ * t)
+    let p patch xs ys
+    if (p != nobody) and ([shadow-buffered?] of p) [
+      set shaded shaded + 1
+    ]
+    set i i + 1
+  ]
+
+  report shaded / (n + 1)
+end
+
+to impute-utci-values
+  ;; purpose: UTCI raster may be NoData on some nodes; direct large penalties break paths
+  ;; strategy:
+  ;; 1) first impute from adjacent nodes (topological averaging)
+  ;; 2) then impute by spatial radius search
+  ;; 3) if still missing, fall back to utci-fill-value
+
+  ; compute fallback value
+  ifelse any? nodes with [utci-valid?] [
+    set utci-fill-value mean [utci-value] of nodes with [utci-valid?]
+  ] [
+    set utci-fill-value utci-discomfort-threshold
+  ]
+
+  ; first pass: neighbor average
+  ask nodes with [not utci-valid?] [
+    let neigh link-neighbors with [utci-valid?]
+    if any? neigh [
+      set utci-value mean [utci-value] of neigh
+      set utci-valid? true
+      set utci-imputed? true
+    ]
+  ]
+
+  ; second pass: spatial search
+  let maxR (ifelse-value (is-number? utci-impute-max-radius-m and utci-impute-max-radius-m > 0) [utci-impute-max-radius-m] [50])
+  let stepR (ifelse-value (is-number? utci-impute-step-m and utci-impute-step-m > 0) [utci-impute-step-m] [10])
+
+  if (not is-number? gis-unit-per-patch) or (gis-unit-per-patch <= 0) [ update-gis-scale ]
+  let maxRu (maxR / gis-unit-per-patch)
+  let stepRu (stepR / gis-unit-per-patch)
+
+  ask nodes with [not utci-valid?] [
+    let r stepRu
+    while [ (not utci-valid?) and (r <= maxRu) ] [
+      let cand nodes in-radius r with [utci-valid?]
+      if any? cand [
+        let nn min-one-of cand [distance myself]
+        set utci-value [utci-value] of nn
+        set utci-valid? true
+        set utci-imputed? true
+      ]
+      set r r + stepRu
+    ]
+
+    ; final fallback: use mean/threshold to keep the model connected
+    if not utci-valid? [
+      set utci-value utci-fill-value
+      set utci-valid? true
+      set utci-imputed? true
+    ]
+  ]
+end
+
+to update-gis-scale
+  ;; purpose:
+  ;; - use meters as a common scale for distance, time, and buffer radius
+  ;; - auto-detect whether roads are lon/lat and convert approximately to meters
+  ;;
+  ;; outputs:
+  ;; - gis-unit-per-patch-x / y:1 world-unit  X/Y
+  ;; - gis-unit-per-patch:X/Y ()
+
+  if roads = nobody [ stop ]
+
+  let env gis:envelope-of roads
+  let xmin item 0 env
+  let xmax item 1 env
+  let ymin item 2 env
+  let ymax item 3 env
+
+  let x-span (xmax - xmin)
+  let y-span (ymax - ymin)
+
+  ;; : envelope ,""
+  set coords-are-degrees? false
+  if (abs xmin <= 180) and (abs xmax <= 180) and (abs ymin <= 90) and (abs ymax <= 90) [
+    set coords-are-degrees? true
+  ]
+
+  ;;  GIS span
+  let x-span-m x-span
+  let y-span-m y-span
+  if coords-are-degrees? [
+    let lat ((ymin + ymax) / 2)
+    ;; :1°≈111320m;1°≈111320*cos(lat)
+    let m-per-deg-lat 111320
+    let m-per-deg-lon (111320 * cos lat)
+    set x-span-m (x-span * m-per-deg-lon)
+    set y-span-m (y-span * m-per-deg-lat)
+  ]
+
+  ;; meters represented by each world unit (patch)
+  set gis-unit-per-patch-x (x-span-m / world-width)
+  set gis-unit-per-patch-y (y-span-m / world-height)
+  set gis-unit-per-patch ((gis-unit-per-patch-x + gis-unit-per-patch-y) / 2)
+
+  ;; default speed
+  if (not is-number? walk-speed-mps) or (walk-speed-mps <= 0) [ set walk-speed-mps 1.5 ]
+end
+
+
+to-report load-dataset-fallback [clip-path orig-path ds-label]
+  ;; load the clipped file first; fall back to original if needed
+  if file-exists? clip-path [
+    report gis:load-dataset clip-path
+  ]
+  if file-exists? orig-path [
+    print (word "Clipped version not found for " ds-label "; using original file instead: " orig-path)
+    report gis:load-dataset orig-path
+  ]
+  user-message (word "Cannot find " ds-label "  file:""\n"
+                    clip-path "\nfallback file also not found:\n"
+                    orig-path "\n\nPlease check file names/paths, or generate the *_clip.shp and matching sidecar files first.")
+  report nobody
+end
+
+to update-commuter-od-nodes
+  ;; 10-minute resolution:
+  ;; - morning: 07:30–09:30  ->
+  ;; - evening: 17:00–20:00  ->
+
+  if not any? commuters [ stop ]
+  if not any? nodes [
+    show "update-commuter-od-nodes: Road network has no nodes; cannot map OD pairs to the network"
+    stop
+  ]
+
+  let dir "to_work"
+  if is-evening-slot? current-time-slot [
+    set dir "to_home"
+  ]
+
+  let light "night"
+  if is-daylight-slot? current-time-slot [
+    set light "daylight"
+  ]
+
+  ask commuters [
+    set trip-dir dir
+    set light-class light
+    set current-time current-time-slot
+
+    if not ((is-number? metro-x) and (is-number? metro-y) and (is-number? office-x) and (is-number? office-y)) [
+      let station-xy safe-xy gis:centroid-of metro-id
+      let office-xy  safe-xy gis:centroid-of office-id
+      if (station-xy != nobody) and (office-xy != nobody) [
+        set metro-x item 0 station-xy
+        set metro-y item 1 station-xy
+        set office-x item 0 office-xy
+        set office-y item 1 office-xy
+      ]
+    ]
+
+    ifelse (is-number? metro-x) and (is-number? metro-y) and (is-number? office-x) and (is-number? office-y) [
+      set od-valid? true
+
+      if trip-dir = "to_work" [
+        set start-x metro-x
+        set start-y metro-y
+        set end-x office-x
+        set end-y office-y
+      ]
+      if trip-dir = "to_home" [
+        set start-x office-x
+        set start-y office-y
+        set end-x metro-x
+        set end-y metro-y
+      ]
+    ] [
+      set od-valid? false
+      set start-x nobody
+      set start-y nobody
+      set end-x nobody
+      set end-y nobody
+    ]
+
+    set commuter-start-node nobody
+    set commuter-end-node nobody
+
+    if od-valid? [
+      let sx start-x
+      let sy start-y
+      let ex end-x
+      let ey end-y
+
+      let stNode node-from-map station-node-map metro-no
+      let ofNode node-from-map office-node-map office-no
+
+      ifelse (stNode != nobody) and (ofNode != nobody) [
+        if trip-dir = "to_work" [
+          set commuter-start-node stNode
+          set commuter-end-node ofNode
+        ]
+        if trip-dir = "to_home" [
+          set commuter-start-node ofNode
+          set commuter-end-node stNode
+        ]
+      ] [
+        set commuter-start-node min-one-of nodes [ distancexy sx sy ]
+        set commuter-end-node   min-one-of nodes [ distancexy ex ey ]
+      ]
+
+      setxy sx sy
+      set status "waiting"
+      set path-index 0
+    ]
+
+    if (commuter-start-node = nobody) or (commuter-end-node = nobody) [
+      show (word "Commuter " who " OD node mapping failed (dir=" trip-dir ", start=" commuter-start-node ", end=" commuter-end-node ")")
+    ]
+  ]
+end
+to-report node-from-map [mp key]
+  ;; get a node from a list shaped like [[key node] ...]; return nobody if not found
+  if not is-list? mp [ report nobody ]
+  let rec filter [p -> (item 0 p = key)] mp
+  if empty? rec [ report nobody ]
+  report item 1 first rec
+end
+to attach-access-node [acc base-road-nodes]
+  ;; connect an OD access node acc to the road network by linking it to multiple nearby network nodes
+  ;; - base-road-nodes pass a snapshot of base road nodes from before access nodes are created
+  if (acc = nobody) or (not any? base-road-nodes) [ stop ]
+
+  let k od-connect-max-n
+  if (not is-number? k) or (k <= 0) [ set k 6 ]
+  if k > count base-road-nodes [ set k count base-road-nodes ]
+
+  ask acc [
+    let targets min-n-of k base-road-nodes [ distance myself ]
+    ;; optional radius filter (meters)
+    if (is-number? od-connect-radius-m) and (od-connect-radius-m > 0) [
+      set targets targets with [ distance-m xcoord ycoord ([xcoord] of myself) ([ycoord] of myself) <= od-connect-radius-m ]
+    ]
+
+    ask targets [
+      if not link-neighbor? myself [
+        create-link-with myself [
+          let x1 [xcoord] of end1
+          let y1 [ycoord] of end1
+          let x2 [xcoord] of end2
+          let y2 [ycoord] of end2
+          set link-weight distance-m x1 y1 x2 y2
+          set color white - 3
+          set hidden? true
+          set thickness 0.1
+        ]
+      ]
+    ]
+  ]
+end
+
+
+
+
+
+
+
+to-report time->min [ts]
+  let hh read-from-string substring ts 0 2
+  let mm read-from-string substring ts 3 5
+  report (hh * 60 + mm)
+end
+
+to-report min->time [m]
+  let hh floor (m / 60)
+  let mm (m mod 60)
+
+  let hh-str ""
+  let mm-str ""
+
+  ifelse hh < 10
+    [ set hh-str (word "0" hh) ]
+    [ set hh-str (word hh) ]
+
+  ifelse mm < 10
+    [ set mm-str (word "0" mm) ]
+    [ set mm-str (word mm) ]
+
+  report (word hh-str ":" mm-str)
+end
+
+to-report build-time-slots [start-ts end-ts step-min]
+  let out []
+  let t time->min start-ts
+  let t-end time->min end-ts
+
+  while [ t <= t-end ] [
+    set out lput (min->time t) out
+    set t (t + step-min)
+  ]
+  report out
+end
+
+to-report is-morning-slot? [ts]
+  let t time->min ts
+  report (t >= time->min "07:30") and (t <= time->min "09:30")
+end
+
+to-report is-evening-slot? [ts]
+  let t time->min ts
+  report (t >= time->min "17:00") and (t <= time->min "20:00")
+end
+
+to-report is-daylight-slot? [ts]
+  let t time->min ts
+  report (t >= time->min "07:30") and (t <= time->min "19:10")
+end
+
+
+to-report replace-string [str old new]
+  let result ""
+  let i 0
+  while [i < length str] [
+    ifelse substring str i (i + length old) = old
+    [
+      set result (word result new)
+      set i i + length old
+    ]
+    [
+      set result (word result substring str i (i + 1))
+      set i i + 1
+    ]
+  ]
+  report result
+end
+
+to-report nearest-node-here
+  report min-one-of nodes [ distance myself ]
+end
+
+to-report nearest-node-at [x0 y0]
+  report min-one-of nodes [ distancexy x0 y0 ]
+end
+
+; ================== check whether a geometry object is valid ==================
+; ================== check whether a GIS feature is valid ==================
+to-report valid-feature? [feature]
+  ; GIS GIS features are usually not lists, so do not test them with is-list?
+  if feature = nobody [ report false ]
+  let ok true
+  carefully [
+    let _ gis:vertex-lists-of feature  ; if geometry vertices can be read, treat the feature as valid
+  ] [
+    set ok false
+  ]
+  report ok
+end
+
+
+; ========= UTCI ()=========
+; suggested globals:
+; globals [ utci-base-dir utci-file-map current-utci-dataset utci-data-loaded? ]
+to-report default-comfort-weight-sets
+  ; each sub-list = [wDist wHeat wShade], normalized when used
+  ; candidate sets with stronger cooling/shading gradients
+  report (list
+    (list 0.25 0.70 0.05)   ; conservative: almost no detour
+    (list 0.20 0.75 0.05)   ; balanced: default
+    (list 0.15 0.80 0.05)   ; more cooling-oriented
+    (list 0.10 0.85 0.05)   ; more cooling-oriented
+    (list 0.05 0.90 0.05)   ; aggressive cooling
+    (list 0.08 0.82 0.10)   ; cooling + shading
+    (list 0.05 0.75 0.20)   ; strong shading (still under budget constraints)
+  )
+end
+to ensure-comfort-weight-sets
+  ; prevent comfort-weight-sets from being overwritten by a scalar value
+  if not is-list? comfort-weight-sets [
+    set comfort-weight-sets default-comfort-weight-sets
+  ]
+end
+
+to init-commuter-heterogeneity
+  ask commuters [
+    ;; Walking speed heterogeneity: approximately 1.1 to 1.8 m/s
+    set personal-walk-speed-mps (1.1 + random-float 0.7)
+
+    ;; Departure-time heterogeneity: 0 to 10 minutes delay within the current slot
+    set departure-delay-sec random 601
+    set departure-delay-ticks departure-delay-sec
+
+    ;; Heat-tolerance heterogeneity: personal UTCI threshold between 30 and 36
+    set personal-utci-threshold (30 + random-float 6)
+
+    ;; Route-preference heterogeneity: distance / heat / shade weights
+    let a (0.2 + random-float 0.8)
+    let b (0.2 + random-float 0.8)
+    let c (0.2 + random-float 0.8)
+    let s (a + b + c)
+
+    set pref-dist  (a / s)
+    set pref-heat  (b / s)
+    set pref-shade (c / s)
+
+    set personal-path-type "unassigned"
+  ]
+end
+
+to-report choose-personal-path-type [c]
+  let m1 path-thermal-metrics ([shortest-path] of c)
+  let m2 path-thermal-metrics ([min-utci-path] of c)
+  let m3 path-thermal-metrics ([min-shadow-path] of c)
+
+  let d1 item 0 m1
+  let d2 item 0 m2
+  let d3 item 0 m3
+
+  let u1 item 2 m1
+  let u2 item 2 m2
+  let u3 item 2 m3
+
+  let s1 item 3 m1
+  let s2 item 3 m2
+  let s3 item 3 m3
+
+  let th [personal-utci-threshold] of c
+
+  let hot1 max (list 0 (u1 - th))
+  let hot2 max (list 0 (u2 - th))
+  let hot3 max (list 0 (u3 - th))
+
+  ;; Lower score is better: shorter, cooler, and more shaded
+  let score1 (([pref-dist] of c) * d1 +
+              ([pref-heat] of c) * hot1 * 500 +
+              ([pref-shade] of c) * (1 - s1) * 1000)
+
+  let score2 (([pref-dist] of c) * d2 +
+              ([pref-heat] of c) * hot2 * 500 +
+              ([pref-shade] of c) * (1 - s2) * 1000)
+
+  let score3 (([pref-dist] of c) * d3 +
+              ([pref-heat] of c) * hot3 * 500 +
+              ([pref-shade] of c) * (1 - s3) * 1000)
+
+  let best-score min (list score1 score2 score3)
+
+  if best-score = score1 [ report "shortest" ]
+  if best-score = score2 [ report "min_utci" ]
+  report "min_shadow"
+end
+to setup-utci-file-map
+  ;; 10-minute UTCI directory
+  set utci-base-dir "C:/Users/31268/Desktop/futianCBD/clipped_to_zone/utci_asc_10min/"
+
+  ;; ensure time-slots already exist
+  if (not is-list? time-slots) or empty? time-slots [
+    setup-time-slots
+  ]
+
+  set utci-file-map []
+
+  foreach time-slots [ ts ->
+    let fname (word "UTCI_" replace-string ts ":""-""_wgs84_clip.asc")
+    set utci-file-map lput (list ts fname) utci-file-map
+  ]
+end
+to init-active-selection-params
+
+  ; -------- default experiment switch: S0 (all on)--------
+  set use-shadow? true
+  set use-utci? true
+  set scenario-id "S0"
+  set detour-max-effective comfort-detour-max-mult
+
+  ; -------- more permissive budgets to make cool corridors easier to choose--------
+  ; :active selection"/"
+  set comfort-dist-budget-mult 1.30
+  set comfort-time-budget-mult 1.30
+  set comfort-time-budget-add  600
+
+  ; -------- new: discomfort metric and thresholds for significant improvement--------
+  ; thermal discomfort threshold: UTCI above this value accumulates discomfort
+  set utci-discomfort-threshold 32
+  ; penalty strength and exponent; exponent > 1 emphasizes hotspot links
+  set utci-discomfort-alpha 0.60
+  set utci-discomfort-power 2
+  ; sun penalty: unshaded daytime links are more uncomfortable (off at night)
+  set sun-penalty-alpha 0.60
+  ;; continuous sun-penalty parameterization: stronger under higher exposure
+  set shadow-exposure-gamma 2
+
+  ;; OD:each metro station and office building gets an access node connected to several nearby road-network nodes
+  set od-connect-max-n 6
+  set od-connect-radius-m 80  ;; meters; <=0 means no radius limit, only nearest N nodes
+
+  ;; solar geometry (optional): if externally computed, set it in update-solar-geometry
+  set sun-altitude-deg 0
+  set sun-azimuth-deg 0
+  ; accept a new route only if discomfort improves by at least these thresholds
+  set comfort-discomfort-improve-ratio 0.05   ; reduce by at least 5%
+  set comfort-discomfort-improve-abs   0      ; can also set a very small positive number to avoid noise
+
+  ; allow additional detour per 1 C increase in average UTCI, with a cap
+  set comfort-heat-detour-per-deg 0.05
+  set comfort-detour-max-mult 1.80
+
+  ; older parameter retained to avoid noise / reversals in avg UTCI
+  set comfort-utci-improve-eps 0.05
+
+  ; reference value for normalizing exposure integrals
+  set comfort-utci-ref 35
+
+  ; multi-candidate weights to improve the chance of cooler-but-not-too-long routes
+  ; each item: [wDist wHeat wShade]
+  set comfort-weight-sets default-comfort-weight-sets
+  set comfort-candidate-count length comfort-weight-sets
+
+  ; daylight flag defaults to false and is updated in load-current-time-data
+  set daylight? false
+end
+
+; ================== solar geometry (optional): allows continuous sun penalty based on solar altitude ==================
+to update-solar-geometry
+  ;; this provides a hook for assigning solar geometry by time slot or external input.
+  ;; - if you already computed solar altitude/azimuth externally, set sun-altitude-deg / sun-azimuth-deg here.
+  ;; - if you do not want to use solar angles, keep the defaults: 45 by day and 0 at night.
+  ifelse member? current-time-slot daylight-time-slots [
+    if (not is-number? sun-altitude-deg) or (sun-altitude-deg <= 0) [ set sun-altitude-deg 45 ]
+  ] [
+    set sun-altitude-deg 0
+  ]
+  ;; example (replace with your own values if needed):
+  ;; let solar-map [["07:30" 35 110] ["08:30" 50 125] ["09:30" 60 140] ["17:00" 35 250] ["18:00" 20 265] ["19:00" 10 280] ["20:00" 0 0]]
+  ;; let rec one-of filter [r -> item 0 r = current-time-slot] solar-map
+  ;; if rec != nobody [ set sun-altitude-deg item 1 rec  set sun-azimuth-deg item 2 rec ]
+end
+
+to-report sun-factor
+  ;; map solar altitude to a 0-1 factor (NetLogo trig uses degrees)
+  if not is-number? sun-altitude-deg [ report (ifelse-value daylight? [1] [0]) ]
+  if sun-altitude-deg <= 0 [ report 0 ]
+  report min list 1 (sin sun-altitude-deg)
+end
+
+; ================== active path selection: update multi-candidate weights and store them in links time-weights ==================
+; ================== active path selection: update multi-candidate weights and store them in links time-weights ==================
+to update-comfort-candidate-weights
+  ensure-comfort-weight-sets
+  ; requires link-weight / utci-cost / shadow-cost to already be updated on links
+  if not any? links [ stop ]
+
+  ; --- defensive check: if comfort-weight-sets is not a list, restore defaults ---
+  if (not is-list? comfort-weight-sets) [
+    set comfort-weight-sets default-comfort-weight-sets
+    set comfort-candidate-count length comfort-weight-sets
+  ]
+
+  let Lref median [link-weight] of links
+  if (not is-number? Lref) or (Lref <= 0) [ set Lref 1 ]
+
+  let Uref comfort-utci-ref
+  if (not is-number? Uref) or (Uref <= 0) [ set Uref 35 ]
+
+  ask links [
+    let wlist []
+    foreach comfort-weight-sets [ ws ->
+      let wDist  item 0 ws
+      let wHeat  item 1 ws
+      let wShade item 2 ws
+
+      ; normalization:
+      ; distance term ~ link-weight / Lref
+      ; heat exposure term ~ utci-cost / (Uref * Lref) (utci-cost = UTCI * distance)
+      ; unshaded term ~ shadow-cost / Lref (shadow-cost = unshaded fraction * distance)
+      let w (wDist  * (link-weight / Lref) +
+             wHeat  * (utci-cost / (Uref * Lref)) +
+             wShade * (shadow-cost / Lref))
+      set wlist lput w wlist
+    ]
+    set time-weights wlist
+
+    ; for compatibility, combined-weight defaults to candidate 1 (balanced)
+    if (is-list? time-weights) and (length time-weights > 1) [
+      set combined-weight item 1 time-weights
+    ]
+  ]
+end
+; ================== active path selection: choose the coolest candidate within budget ==================
+to-report choose-best-comfort-path [start-n end-n base-path]
+  ; base-path base-path must already exist; select only candidates that significantly lower discomfort without too much detour
+  if (not is-list? base-path) or (length base-path < 2) [
+    report (list [] "invalid")
+  ]
+
+  let mS path-thermal-metrics base-path
+  let distS item 0 mS
+  let timeS item 1 mS
+  let utciS item 2 mS
+  let discS item 4 mS
+
+  if distS <= 0 [ report (list base-path "shortest") ]
+  ; if the baseline path has no above-threshold discomfort, no detour is needed
+  if discS <= 0 [ report (list base-path "shortest") ]
+
+  ; detour budgets are based on comfort-dist/time-budget-mult and bounded by comfort-detour-max-mult; hotter paths allow more detour
+  let heatLevel max (list 0 (utciS - utci-discomfort-threshold))
+
+  let detour-min 1.0
+  let detour-max comfort-detour-max-mult
+  set detour-max-effective detour-max
+
+  let distMult max (list detour-min (min (list detour-max (comfort-dist-budget-mult + heatLevel * comfort-heat-detour-per-deg))))
+  let timeMult max (list detour-min (min (list detour-max (comfort-time-budget-mult + heatLevel * comfort-heat-detour-per-deg))))
+  let distBudget distS * distMult
+  let timeBudget max (list (timeS * timeMult) (timeS + comfort-time-budget-add))
+
+  ; "significant-improvement threshold: reduce discS by at least a ratio and at least an absolute amount
+  let improveNeed max (list (discS * comfort-discomfort-improve-ratio) comfort-discomfort-improve-abs)
+
+  ; candidate types: first discomfort-cost, then utci-cost and the comfort-i sets
+  let candidate-types []
+  set candidate-types lput "discomfort-cost" candidate-types
+  set candidate-types lput "utci-cost" candidate-types
+
+  let i 0
+  while [ i < comfort-candidate-count ] [
+    set candidate-types lput (word "comfort-" i) candidate-types
+    set i i + 1
+  ]
+
+  ; "maximum shade"()
+  if daylight? [
+    set candidate-types lput "shadow-cost" candidate-types
+  ]
+
+  let bestPath base-path
+  let bestType "shortest"
+  let bestDisc discS
+
+  foreach candidate-types [ wt ->
+    let p compute-dijkstra start-n end-n wt
+    if (is-list? p) and (length p >= 2) [
+      let m path-thermal-metrics p
+      let d item 0 m
+      let tt item 1 m
+      let disc item 4 m
+      let u item 2 m
+
+      if (d > 0) and (d <= distBudget) and (tt <= timeBudget) [
+        ; must meet the significant discomfort-reduction threshold
+        if disc <= (discS - improveNeed) [
+          ; also avoid a clear worsening in average UTCI
+          if u <= (utciS + 0.10) [
+            if disc < bestDisc [
+              set bestDisc disc
+              set bestPath p
+              set bestType wt
+            ]
+          ]
+        ]
+      ]
+    ]
+  ]
+
+  report (list bestPath bestType)
+end
+
+
+
+
+; ================== ASCIIUTCI ==================
+to load-utci-asc [time-slot]
+
+  ;; : utci-file-map  list,
+  if not is-list? utci-file-map [
+    show "Warning: utci-file-map ,..."
+    setup-utci-file-map
+  ]
+
+  ;; 1)  map
+  let matches filter [ pair -> item 0 pair = time-slot ] utci-file-map
+
+  if empty? matches [
+    set current-utci-dataset nobody
+    set utci-data-loaded? false
+    show (word "Error: utci-file-map does not contain this time slot: " time-slot)
+    stop
+  ]
+
+  let asc-filename item 1 first matches
+
+  ;; 2)
+  let asc-path word utci-base-dir asc-filename
+
+  ;; 3)
+  if file-exists? asc-path [
+    set current-utci-dataset gis:load-dataset asc-path
+    set utci-data-loaded? true
+    show (word "Loaded UTCI ASC data: " asc-path)
+    show (word "UTCI raster envelope: " gis:envelope-of current-utci-dataset)
+  ]
+  if not file-exists? asc-path [
+    set current-utci-dataset nobody
+    set utci-data-loaded? false
+    show (word "Warning: UTCI ASC: " asc-path)
+  ]
+end
+to-report compute-dijkstra [start-node-param end-node-param weight-type]
+  if start-node-param = end-node-param [ report (list start-node-param) ]
+
+  ask nodes [
+    set node-dist 1.0e20
+    set node-prev nobody
+    set visited? false
+  ]
+  ask start-node-param [ set node-dist 0 ]
+
+  while [ any? nodes with [not visited? and node-dist < 9.9e19] ] [
+    let current-node min-one-of (nodes with [not visited?]) [node-dist]
+    if current-node = nobody [ report [] ]
+    ask current-node [ set visited? true ]
+
+    ask current-node [
+      let neighbor-nodes link-neighbors with [not visited?]
+      ask neighbor-nodes [
+        let edge-weight 0
+        if weight-type = "link-weight" [
+          set edge-weight [link-weight] of (link-with current-node)
+        ]
+        if weight-type = "combined-weight" [
+          set edge-weight [combined-weight] of (link-with current-node)
+        ]
+        if weight-type = "shadow-weight" [
+          set edge-weight [shadow-weight] of (link-with current-node)
+        ]
+        if weight-type = "shadow-cost" [
+          set edge-weight [shadow-cost] of (link-with current-node)
+        ]
+        if weight-type = "utci-weight" [
+          set edge-weight [utci-weight] of (link-with current-node)
+        ]
+        if weight-type = "utci-cost" [
+          set edge-weight [utci-cost] of (link-with current-node)
+        ]
+        if weight-type = "discomfort-cost" [
+          set edge-weight [discomfort-cost] of (link-with current-node)
+        ]
+        ; :comfort-N( links  time-weights  N )
+        if (length weight-type > 8) and (substring weight-type 0 8 = "comfort-") [
+          let idx read-from-string substring weight-type 8 length weight-type
+          let tw [time-weights] of (link-with current-node)
+          ifelse (is-list? tw) and (idx >= 0) and (idx < length tw) [
+            set edge-weight item idx tw
+          ] [
+            set edge-weight 1.0e20
+          ]
+        ]
+
+        if node-dist > [node-dist] of current-node + edge-weight [
+          set node-dist [node-dist] of current-node + edge-weight
+          set node-prev current-node
+        ]
+      ]
+    ]
+
+    if current-node = end-node-param [
+      let path-list []
+      let current end-node-param
+      while [ current != nobody ] [
+        set path-list fput current path-list
+        set current [node-prev] of current
+      ]
+      report path-list
+    ]
+  ]
+
+  report []
+end
+
+; ==================  ==================
+to setup-time-slots
+  ;; 10-minute resolution:
+  ;; morning peak 07:30-09:30
+  ;; evening peak 17:00-20:00
+  let morning-slots build-time-slots "07:30""09:30" 10
+  let evening-slots build-time-slots "17:00""20:00" 10
+
+  set time-slots (sentence morning-slots evening-slots)
+  set current-time-index 0
+  set current-time-slot item current-time-index time-slots
+
+  ;; only until 19:10 is treated as daylight; 19:20 onward is night
+  set daylight-time-slots []
+  foreach time-slots [ ts ->
+    if is-daylight-slot? ts [
+      set daylight-time-slots lput ts daylight-time-slots
+    ]
+  ]
+
+  ifelse is-morning-slot? current-time-slot
+    [ set simulation-phase "morning" ]
+    [ set simulation-phase "evening" ]
+
+  ;; note: do not call load-utci-asc here again
+end
+to setup
+  clear-all
+  reset-ticks
+  ;; (, TO/TO-REPORT expected)
+  set station-node-map []
+  set office-node-map []
+  setup-time-slots
+  setup-utci-file-map
+  init-active-selection-params  ;; /()
+  ask patches [ set pcolor black ]
+
+  ;
+  ;; : road3_clip.shp; road3.shp
+  let roads-path "C:/Users/31268/Desktop/futianCBD/clipped_to_zone/vectors/road3_clip.shp"
+  let roads-path-alt "C:/Users/31268/Desktop/futianCBD/road3.shp"
+
+  ifelse file-exists? roads-path [
+    set roads gis:load-dataset roads-path
+  ] [
+    ifelse file-exists? roads-path-alt [
+      print (word "Warning: clipped roads file not found; using original roads: " roads-path-alt)
+      set roads gis:load-dataset roads-path-alt
+    ] [
+      user-message (word
+        "Road shapefile not found. Please check the path:\n"
+        "roads-path: " roads-path "\n"
+        "roads-path-alt: " roads-path-alt "\n"
+        "Please check the file name/path, or generate the *_clip.shp first."
+      )
+      stop
+    ]
+  ]
+
+
+
+
+  ;; zone shapefile path (site boundary)。,。
+  set zone-path "C:/Users/31268/Desktop/futianCBD/zone.shp"
+  ;; zone()。。
+  ;; zone()。zone。
+  ifelse file-exists? zone-path [
+    set zone-data gis:load-dataset zone-path
+    show (word "Loaded zone data: " zone-path)
+  ] [
+    set zone-data nobody
+    show (word "Warning: zone shapefile not found; skipping zone clipping: " zone-path)
+  ]
+  ;;  set the world envelope from the roads dataset to avoid mismatch with the UTCI raster
+  gis:set-world-envelope (gis:envelope-of roads)
+  ;; shadow buffer distance (meters)
+  set shadow-buffer-m 10
+  update-gis-scale
+  show (word "roads : " gis:envelope-of roads)
+;;  /  / :,
+let buildings-path "C:/Users/31268/Desktop/futianCBD/clipped_to_zone/vectors/allbuilding_clip.shp"
+let buildings-path-alt "C:/Users/31268/Desktop/futianCBD/allbuilding.shp"
+set buildings load-dataset-fallback buildings-path buildings-path-alt "allbuilding"
+
+let officeb-path "C:/Users/31268/Desktop/futianCBD/clipped_to_zone/vectors/building_clip.shp"
+let officeb-path-alt "C:/Users/31268/Desktop/futianCBD/building.shp"
+set office-buildings load-dataset-fallback officeb-path officeb-path-alt "building"
+
+let metro-path "C:/Users/31268/Desktop/futianCBD/clipped_to_zone/vectors/point__clip.shp"
+let metro-path-alt "C:/Users/31268/Desktop/futianCBD/point_.shp"
+set metro-stations load-dataset-fallback metro-path metro-path-alt "metro-stations"
+
+  ; UTCI
+  set current-utci-dataset nobody
+  set utci-data-loaded? false
+  set min-utci 0
+  set max-utci 0
+
+  set shadow-date-string "20250701"  ;;
+  set shadow-data nobody
+
+  ;; (1=,0=)
+  let greensp-path "C:/Users/31268/Desktop/futianCBD/greensp/greensp_binary.asc"
+  ifelse file-exists? greensp-path [
+    set plant-shadow-raster gis:load-dataset greensp-path
+    set plant-shadow-loaded? true
+    show (word "Loaded plant-shade raster: " greensp-path)
+    show (word "Plant raster envelope: " gis:envelope-of plant-shadow-raster)
+  ] [
+    set plant-shadow-raster nobody
+    set plant-shadow-loaded? false
+    show (word "Warning: plant-shade raster not found: " greensp-path)
+  ]
+  ; ()
+  set office-commuters-map []
+  draw-basemap
+  build-road-network
+  assign-commuters-to-nearest-metro
+  ;; :Commuter OD (/)
+  update-commuter-od-nodes
+  load-current-time-data
+
+  ; ==================  ==================
+  if not any? commuters [
+    show "No commuters are available for path computation"
+    reset-ticks
+    stop
+  ]
+
+  if count nodes = 0 [
+    user-message "The road network has no nodes. Check road3.shp loading or build-road-network."
+    stop
+  ]
+
+  ;
+  ask links with [color != white - 3] [
+    set color white - 3
+    set hidden? true
+    set thickness 0.1
+  ]
+
+  ;
+  ask commuters [
+    ; get origin and destination coordinates
+    let station-xy safe-xy gis:centroid-of metro-id
+    let office-xy safe-xy gis:centroid-of office-id
+
+    if (station-xy = nobody or office-xy = nobody) [
+      show (word "Commuter " who " has invalid OD coordinates")
+      stop
+    ]
+
+    ;
+    let st-x item 0 station-xy
+    let st-y item 1 station-xy
+    let off-x item 0 office-xy
+    let off-y item 1 office-xy
+
+    ;
+    let start-n min-one-of nodes [distancexy st-x st-y]
+    let end-n min-one-of nodes [distancexy off-x off-y]
+
+    set commuter-start-node start-n
+    set commuter-end-node end-n
+
+    if (start-n = nobody or end-n = nobody) [
+      show (word "Commuter " who " failed to map origin or destination to nearest node")
+      stop
+    ]
+
+    ; ()
+    let shortest-path-calc compute-dijkstra start-n end-n "link-weight"
+    set shortest-path shortest-path-calc
+
+    ; UTCI
+    ; active selection:()
+    let chosen choose-best-comfort-path start-n end-n shortest-path-calc
+    let min-utci-path-calc item 0 chosen
+    let chosen-type item 1 chosen
+    set min-utci-path min-utci-path-calc
+
+    ; ()
+    let min-shadow-path-calc compute-dijkstra start-n end-n "shadow-cost"
+    set min-shadow-path min-shadow-path-calc
+
+    ;; Let each agent choose one of the three candidate path families using its own preferences
+    let chosen-path-type choose-personal-path-type self
+    set personal-path-type chosen-path-type
+    set current-path-type chosen-path-type
+
+    if chosen-path-type = "shortest" [
+      set commuter-path shortest-path
+    ]
+    if chosen-path-type = "min_utci" [
+      set commuter-path min-utci-path
+    ]
+    if chosen-path-type = "min_shadow" [
+      set commuter-path min-shadow-path
+    ]
+
+    set path-index 0
+    set status "waiting"
+
+    ; compute path statistics
+    let total-distance 0
+    let total-utci 0
+    let total-shadow 0
+    let path-length length commuter-path
+
+    ; compute path metrics
+    if path-length > 1 [
+      let node-stat-first first commuter-path
+      foreach but-first commuter-path [ node-stat-b ->
+        if (node-stat-first != nobody and node-stat-b != nobody) [
+          ;  node-stat-first  node-stat-b
+          let the-link [link-with node-stat-b] of node-stat-first
+          if the-link != nobody [
+            ;
+            let edge-distance [link-weight] of the-link
+            set total-distance total-distance + edge-distance
+
+            ; UTCI
+            let utci1 [utci-value] of node-stat-first
+            let utci2 [utci-value] of node-stat-b
+            let avg-utci (utci1 + utci2) / 2
+            set total-utci total-utci + (avg-utci * edge-distance)
+
+            ;
+            let edge-shadow [shadow-weight] of the-link
+            set total-shadow total-shadow + (edge-shadow * edge-distance)
+          ]
+        ]
+        set node-stat-first node-stat-b
+      ]
+    ]
+
+    ;
+    set distance-traveled total-distance
+    let v0 personal-walk-speed-mps
+    if (not is-number? v0) or (v0 <= 0) [ set v0 walk-speed-mps ]
+    set travel-time total-distance / v0 ;  walk-speed-mps (m/s)
+    if total-distance > 0 [
+      set total-utci-exposure total-utci / total-distance
+      set total-shadow-exposure total-shadow / total-distance
+    ]
+
+    ; display the current path
+    ask links with [color != white - 3] [
+      set color white - 3
+      set hidden? true
+      set thickness 0.1
+    ]
+
+    ; set color by path type
+    let path-color blue
+    if current-path-type = "shortest" [ set path-color blue ]
+    if current-path-type = "min_utci" [ set path-color green ]
+    if current-path-type = "min_shadow" [ set path-color orange ]
+
+    ;
+    if length commuter-path > 1 [
+      let node-curr-first first commuter-path
+      foreach but-first commuter-path [ node-curr-b ->
+        if (node-curr-first != nobody and node-curr-b != nobody and
+            node-curr-first != node-curr-b) [
+          ;  node-curr-first  node-curr-b
+          let the-link [link-with node-curr-b] of node-curr-first
+          if the-link != nobody [
+            ask the-link [
+              set color path-color
+              set thickness 0.4
+              set hidden? false
+            ]
+          ]
+        ]
+        set node-curr-first node-curr-b
+      ]
+    ]
+
+    ; store path types
+    set path-types ["shortest""min_utci""min_shadow"]
+  ]
+
+  ; display comparison of path types
+  ask commuters [
+    ; display shortest path (blue)
+    if length shortest-path > 1 [
+      let node-short-first first shortest-path
+      foreach but-first shortest-path [ node-short-b ->
+        if (node-short-first != nobody and node-short-b != nobody and
+            node-short-first != node-short-b) [
+          let the-link [link-with node-short-b] of node-short-first
+          if the-link != nobody [
+            ask the-link [
+              set color blue - 1
+              set thickness 0.3
+              set hidden? false
+            ]
+          ]
+        ]
+        set node-short-first node-short-b
+      ]
+    ]
+
+    ; display minimum UTCI path (green)
+    if length min-utci-path > 1 [
+      let node-utci-first first min-utci-path
+      foreach but-first min-utci-path [ node-utci-b ->
+        if (node-utci-first != nobody and node-utci-b != nobody and
+            node-utci-first != node-utci-b) [
+          let the-link [link-with node-utci-b] of node-utci-first
+          if the-link != nobody [
+            ask the-link [
+              set color green - 1
+              set thickness 0.25
+              set hidden? false
+            ]
+          ]
+        ]
+        set node-utci-first node-utci-b
+      ]
+    ]
+
+    ; display minimum shadow-exposure path (orange)
+    if length min-shadow-path > 1 [
+      let node-shadow-first first min-shadow-path
+      foreach but-first min-shadow-path [ node-shadow-b ->
+        if (node-shadow-first != nobody and node-shadow-b != nobody and
+            node-shadow-first != node-shadow-b) [
+          let the-link [link-with node-shadow-b] of node-shadow-first
+          if the-link != nobody [
+            ask the-link [
+              set color orange - 1
+              set thickness 0.2
+              set hidden? false
+            ]
+          ]
+        ]
+        set node-shadow-first node-shadow-b
+      ]
+    ]
+  ]
+
+  ; ================== visualize UTCI distribution (inline code) ==================
+  if min-utci != max-utci [
+    ask nodes [
+      set hidden? true
+      set size 0
+    ]
+  ]
+
+  ;
+  let legend-x min-pxcor + 1
+  let legend-y max-pycor - 1
+
+  let color-steps 10
+  ; who
+  let step-counter 0
+  while [step-counter < color-steps] [
+    let patch-x legend-x + step-counter
+    ask patch patch-x legend-y [
+      let color-value 10 + (step-counter * 130 / color-steps)
+      set pcolor color-value
+      set plabel-color white
+    ]
+    set step-counter step-counter + 1
+  ]
+
+  ask patch legend-x (legend-y - 1) [
+    set plabel "UTCI exposure legend"
+    set plabel-color white
+  ]
+
+  ask patch legend-x legend-y [
+    set plabel (word min-utci)
+    set plabel-color white
+  ]
+
+  ask patch (legend-x + color-steps - 1) legend-y [
+    set plabel (word max-utci)
+    set plabel-color white
+  ]
+
+  reset-ticks
+end
+
+; ================== draw basemap ==================
+to draw-basemap
+  gis:set-drawing-color white + 2
+  gis:fill buildings 1.0
+  gis:set-drawing-color white + 1
+  gis:draw buildings 0.2
+  gis:set-drawing-color blue - 2
+  gis:fill office-buildings 1.0
+  gis:set-drawing-color blue
+  gis:draw office-buildings 0.3
+  gis:set-drawing-color yellow - 2
+  gis:draw roads 0.4
+  gis:set-drawing-color red
+  gis:draw metro-stations 0.8
+end
+
+; ================== build road network ==================
+to build-road-network
+  ask nodes [ die ]
+  ask links [ die ]
+
+  if roads = nobody [
+    user-message "Roads dataset not loaded; cannot build network"
+    stop
+  ]
+
+  ;;
+  if (not is-number? node-merge-tol-m) or (node-merge-tol-m <= 0) [ set node-merge-tol-m 1 ]
+  if (not is-number? gis-unit-per-patch) or (gis-unit-per-patch <= 0) [ update-gis-scale ]
+
+  ;; use a meter-based tolerance to quantize vertices and reduce duplicates/disconnections
+  let tol (node-merge-tol-m / gis-unit-per-patch)
+  if (not is-number? tol) or (tol <= 0) [ set tol 0.0001 ]
+
+  let node-index table:make
+
+  let feats gis:feature-list-of roads
+  foreach feats [ f ->
+    let vlists gis:vertex-lists-of f
+
+    foreach vlists [ vlist ->
+      if is-list? vlist and length vlist > 1 [
+        let prev-node nobody
+
+        foreach vlist [ v ->
+          let loc nobody
+          if is-list? v and length v = 2 [
+            set loc v
+          ]
+          if loc = nobody [
+            let tmp gis:location-of v
+            if is-list? tmp and length tmp = 2 [
+              set loc tmp
+            ]
+          ]
+
+          if loc != nobody [
+            let x0 item 0 loc
+            let y0 item 1 loc
+
+            ;; quantized coordinate key
+            let qx round (x0 / tol)
+            let qy round (y0 / tol)
+            let key (word qx "," qy)
+
+            let cur nobody
+            if table:has-key? node-index key [
+              set cur table:get node-index key
+            ]
+
+            if cur = nobody [
+              create-nodes 1 [
+                set xcoord x0
+                set ycoord y0
+                setxy xcoord ycoord
+                set size 0
+                set color white
+                set hidden? true
+              ]
+              ;; the newly created node has the largest who id
+              set cur max-one-of nodes [who]
+              table:put node-index key cur
+            ]
+
+            if (prev-node != nobody) and (cur != nobody) and (cur != prev-node) [
+              ask prev-node [
+                if not link-neighbor? cur [
+                  create-link-with cur [
+                    let x1 [xcoord] of end1
+                    let y1 [ycoord] of end1
+                    let x2 [xcoord] of end2
+                    let y2 [ycoord] of end2
+                    set link-weight distance-m x1 y1 x2 y2   ;; always use meters
+                    set color white - 3
+                    set hidden? true
+                    set thickness 0.1
+                  ]
+                ]
+              ]
+            ]
+
+            set prev-node cur
+          ]
+        ]
+      ]
+    ]
+  ]
+
+  show (word "Network construction complete: nodes=" count nodes ", =" count links)
+end
+
+
+; ==================  ==================
+; ================== assign commuters: full-combination OD pairs (office buildings x metro stations) ==================
+to assign-commuters-to-nearest-metro
+  ;; changed design: from nearest-station assignment to full office x station combinations
+  ;; commuters count = count(office-buildings) * count(metro-stations)
+
+  ;; 0) clear old agents/markers to avoid duplication
+  ask commuters [ die ]
+  ask marks [ die ]
+  ask shadows [ die ]
+  ;; clear old OD access nodes
+  ask nodes with [access-node? = true] [ die ]
+
+  ;; 1)
+  set station-node-map []
+  set office-node-map []
+  set office-commuters-map []
+
+  ;; 2) basic checks
+  if not any? nodes [
+    user-message "(nodes=0), build-road-network"
+    stop
+  ]
+  let base-road-nodes nodes with [access-node? != true]
+
+  let st-feats gis:feature-list-of metro-stations
+  let of-feats gis:feature-list-of office-buildings
+  if (length st-feats = 0) or (length of-feats = 0) [
+    user-message "(metro-stations / office-buildings)"
+    stop
+  ]
+
+  ;; -------- 3) metro station records + access nodes --------
+  ;; st-record: [station-feature sx sy station-no]
+  let st-records []
+  let sNo 1
+  foreach st-feats [ stFeat ->
+    let sxy safe-xy gis:centroid-of stFeat
+    if sxy != nobody [
+      let sx item 0 sxy
+      let sy item 1 sxy
+
+      set st-records lput (list stFeat sx sy sNo) st-records
+
+      ;; visual markers (optional)
+      create-marks 1 [
+        setxy sx sy
+        set shape "flag"
+        set color yellow
+        set size 0.8
+        set label (word "M" sNo)
+        set hidden? false
+      ]
+
+      ;; create metro OD access nodes and connect them to multiple nearby network nodes
+      create-nodes 1 [
+        set xcoord sx
+        set ycoord sy
+        setxy xcoord ycoord
+        set size 0
+        set color red
+        set hidden? true
+        set access-node? true
+        set access-kind "station"
+        set access-key sNo
+      ]
+      let stNode max-one-of nodes [who]
+      set station-node-map lput (list sNo stNode) station-node-map
+      attach-access-node stNode base-road-nodes
+
+      set sNo sNo + 1
+    ]
+  ]
+
+  if empty? st-records [
+    user-message "Metro station coordinates are invalid; commuters cannot be created"
+    stop
+  ]
+
+  ;; -------- 4) office building records + access nodes --------
+  ;; of-record: [office-feature ox oy office-no]
+  let of-records []
+  let oNo 1
+  foreach of-feats [ office ->
+    let oxy safe-xy gis:centroid-of office
+    if oxy != nobody [
+      let ox item 0 oxy
+      let oy item 1 oxy
+
+      set of-records lput (list office ox oy oNo) of-records
+
+      ;; office building markers (optional; may be dense)
+      create-marks 1 [
+        setxy ox oy
+        set shape "house"
+        set color blue
+        set size 0.9
+        set label (word "O" oNo)
+        set hidden? false
+      ]
+
+      ;; create office OD access nodes and connect them to multiple nearby network nodes
+      create-nodes 1 [
+        set xcoord ox
+        set ycoord oy
+        setxy xcoord ycoord
+        set size 0
+        set color blue
+        set hidden? true
+        set access-node? true
+        set access-kind "office"
+        set access-key oNo
+      ]
+      let ofNode max-one-of nodes [who]
+      set office-node-map lput (list oNo ofNode) office-node-map
+      attach-access-node ofNode base-road-nodes
+
+      set oNo oNo + 1
+    ]
+  ]
+
+  if empty? of-records [
+    user-message "Office building coordinates are invalid; commuters cannot be created"
+    stop
+  ]
+
+  ;; optionally bridge connected components that contain station/office access nodes
+  carefully [
+    connect-required-components
+  ] [
+    show (word "connect-required-components Warning: " error-message)
+  ]
+
+  ;; -------- 5) create commuters for all office x station combinations--------
+  let created 0
+
+  foreach of-records [ orc ->
+    let officeFeat item 0 orc
+    let ox item 1 orc
+    let oy item 2 orc
+    let officeNo item 3 orc
+
+    foreach st-records [ src ->
+      let stationFeat item 0 src
+      let sx item 1 src
+      let sy item 2 src
+      let stationNo item 3 src
+
+      create-commuters 1 [
+        set shape "person"
+        set color green
+        set size 0.7
+
+        ;; base state
+        set commuter-path []
+        set path-index 0
+        set commuter-start-node nobody
+        set commuter-end-node nobody
+        set shortest-path []
+        set min-utci-path []
+        set min-shadow-path []
+        set current-path-type "uncomputed"
+        set status "waiting"
+
+        ;; store GIS feature references for diagnosis/fallback
+        set office-id officeFeat
+        set metro-id stationFeat
+
+        ;; ids used by export and mapping
+        set office-no officeNo
+        set metro-no stationNo
+
+        ;; cache fixed endpoint coordinates
+        set office-x ox
+        set office-y oy
+        set metro-x sx
+        set metro-y sy
+
+        ;; the current-slot OD will be recomputed by update-commuter-od-nodes
+        set start-x nobody
+        set start-y nobody
+        set end-x nobody
+        set end-y nobody
+        set od-valid? false
+
+        ;; default labels (updated every time slot)
+        set trip-dir "to_work"
+        set light-class "night"
+        set current-time current-time-slot
+
+        ;; initialize statistics
+        set total-utci-exposure 0
+        set total-shadow-exposure 0
+        set travel-time 0
+        set distance-traveled 0
+
+        ;; initial position placed at the station (visualization only)
+        setxy sx sy
+      ]
+
+      ;;  office-commuters-map :[officeNo metroNo distance]
+      set office-commuters-map lput (list officeNo stationNo (distance-m ox oy sx sy)) office-commuters-map
+
+      set created created + 1
+    ]
+  ]
+
+  show (word "Created " created " commuters (full office x station combination; expected "
+             (length of-records * length st-records) ")")
+
+  init-commuter-heterogeneity
+end
+
+; ================== load data for the current time slot ==================
+to load-current-time-data
+  let time-string current-time-slot
+
+  ;; clear current shadow data and previous shadow turtles each time slot
+  set shadow-data nobody
+  ask shadows [ die ]
+
+  ;; decide whether the slot is daylight; daylight sun penalty still applies even if shadow files are missing
+  set daylight? false
+  if is-list? daylight-time-slots [
+    if member? time-string daylight-time-slots [ set daylight? true ]
+  ]
+
+  ;; shadow file date is fixed by shadow-date-string in globals
+  let shadow-features []
+  ;; directory containing shadow shapefiles
+  let shadow-base-dir "C:/Users/31268/Desktop/futianCBD/clipped_to_zone/vectors/"
+  ;; time-string for example, "07:30" -> "0730"
+  let time-tag (word substring time-string 0 2 substring time-string 3 5)
+  let shadow-path (word shadow-base-dir "shadow_" shadow-date-string "_" time-tag "_clean_clip.shp")
+
+  ifelse file-exists? shadow-path [
+    set shadow-data gis:load-dataset shadow-path
+    ;;
+    set daylight? true
+    show (word "Loaded shadow data: " shadow-path)
+
+    if shadow-data != nobody [
+      set shadow-features gis:feature-list-of shadow-data
+
+      ;; do not draw shadow blocks; shadow-data is only used for later calculations
+    ]
+  ] [
+    ;;  file:
+    ;; - :""
+    ;; - :(daylight?=false)
+    if daylight? [
+      show (word "  file:(): " shadow-path)
+    ]
+    if not daylight? [
+      show (word " Shadow file not found; processing as night / no-shadow: " shadow-path)
+    ]
+  ]
+
+  ;; update solar altitude/azimuth (optional, used for continuous sun penalty)
+  update-solar-geometry
+
+  ;; load the UTCI ASCII raster for the current time slot
+  load-utci-asc current-time-slot
+
+  ;; update scale so buffers/distances are in meters
+  if (not is-number? gis-unit-per-patch) or (gis-unit-per-patch <= 0) [ update-gis-scale ]
+
+  ;; check whether the UTCI raster overlaps the roads layer (diagnostic only)
+  if current-utci-dataset != nobody [
+    let r-env gis:envelope-of roads
+    let u-env gis:envelope-of current-utci-dataset
+    let rminx item 0 r-env
+    let rmaxx item 1 r-env
+    let rminy item 2 r-env
+    let rmaxy item 3 r-env
+    let uminx item 0 u-env
+    let umaxx item 1 u-env
+    let uminy item 2 u-env
+    let umaxy item 3 u-env
+
+    if (rmaxx < uminx) or (umaxx < rminx) or (rmaxy < uminy) or (umaxy < rminy) [
+      show " UTCI raster does not overlap the road network. Check CRS/extent and reproject or resample in GIS first."
+      show (word "roads env=" r-env)
+      show (word "utci  env=" u-env)
+      stop
+    ]
+  ]
+
+  ;; ---- combine building shadow and plant shade into shadow-buffered? ----
+  ask patches [ set shadow-buffered? false ]
+
+  if ((not is-number? shadow-buffer-m) or (shadow-buffer-m <= 0)) [
+    set shadow-buffer-m 10
+  ]
+  let r (shadow-buffer-m / gis-unit-per-patch)
+
+  ;; 1) building shadow (time-varying shapefile)
+  if daylight? and (shadow-data != nobody) [
+    let shadePatches (patches gis:intersecting shadow-data)
+    ask shadePatches [
+      set shadow-buffered? true
+      ask (patches in-radius r) [ set shadow-buffered? true ]
+    ]
+  ]
+
+  ;; 2) plant shade (binary asc)
+  ;; convention: raster values > 0 indicate plant shade / tree shade
+  if plant-shadow-loaded? and (plant-shadow-raster != nobody) [
+    ask patches [
+      let gval gis:raster-sample plant-shadow-raster (list pxcor pycor)
+      if (gval != false) and is-number? gval [
+        if gval > 0 [
+          set shadow-buffered? true
+          ask (patches in-radius r) [ set shadow-buffered? true ]
+        ]
+      ]
+    ]
+  ]
+
+  ;; update node shadow-value and utci-value
+  ask nodes [
+    set shadow-value 0
+
+    if daylight? [
+      if [shadow-buffered?] of patch-here [
+        set shadow-value 1
+      ]
+
+      ;; plant shade fallback: directly sample greensp_binary.asc at node coordinates
+      if (shadow-value = 0) and plant-shadow-loaded? and (plant-shadow-raster != nobody) [
+        let gval gis:raster-sample plant-shadow-raster (list xcoord ycoord)
+        if (gval != false) and is-number? gval [
+          if gval > 0 [
+            set shadow-value 1
+          ]
+        ]
+      ]
+    ]
+
+    if not daylight? [
+      ;; at night, set shadow-value to 1 to mean no sun exposure penalty
+      set shadow-value 1
+    ]
+
+    ;; sample the UTCI raster
+    set utci-value nobody
+    set utci-valid? false
+    set utci-imputed? false
+
+    if current-utci-dataset != nobody [
+      let sample-value gis:raster-sample current-utci-dataset (list xcoord ycoord)
+
+      ;; accept only numeric raster samples; treat others as nobody
+      if (sample-value != false) and is-number? sample-value [
+        if sample-value > -9000 [
+          set utci-value sample-value
+          set utci-valid? true
+        ]
+      ]
+    ]
+  ]
+
+  ;; count raw invalid UTCI samples (sampling failure / NoData)
+  let invalid0 count nodes with [not utci-valid?]
+  if invalid0 > 0 [
+    show (word "Number of nodes with invalid UTCI samples (sampling failure / NoData): " invalid0)
+  ]
+
+  ;; impute UTCI values to avoid extreme link weights
+  impute-utci-values
+
+  ;; update link weights (distance / shadow / heat exposure / discomfort)
+  ask links [
+    let node1 end1
+    let node2 end2
+
+    let x1 [xcoord] of node1
+    let y1 [ycoord] of node1
+    let x2 [xcoord] of node2
+    let y2 [ycoord] of node2
+
+    ;; distance: always use meters
+    set link-weight distance-m x1 y1 x2 y2
+
+    ;; average UTCI (or a fallback constant if use-utci? is off)
+    let utci1 [utci-value] of node1
+    let utci2 [utci-value] of node2
+    if not is-number? utci1 [ set utci1 utci-fill-value ]
+    if not is-number? utci2 [ set utci2 utci-fill-value ]
+    let avg-utci (utci1 + utci2) / 2
+    if not use-utci? [ set avg-utci utci-fill-value ]
+    set utci-weight avg-utci
+
+    ;; shadow fraction (0-1): sample buffered patches; if use-shadow? is off, treat as fully shaded (=1)
+    if use-shadow? [
+      if daylight? [
+        set shadow-weight shadow-fraction-between x1 y1 x2 y2
+      ]
+      if not daylight? [
+        set shadow-weight 1
+      ]
+    ]
+    if not use-shadow? [ set shadow-weight 1 ]
+
+    ;; cost for routing/comparison: if shadows are off, shadow-cost collapses to shortest path distance
+    if not use-shadow? [
+      set shadow-cost link-weight
+    ]
+    if use-shadow? [
+      if daylight? [
+        set shadow-cost ((1 - shadow-weight) * link-weight)  ; unshaded exposure distance (meters)
+      ]
+      if not daylight? [
+        ;; at night, shadow is not an extra cost; collapse to shortest path distance
+        set shadow-cost link-weight
+      ]
+    ]
+
+    ;; heat exposure: if UTCI is off, utci-cost collapses to shortest path distance
+    if use-utci? [
+      set utci-cost (avg-utci * link-weight)                 ; heat exposure = UTCI * distance
+    ]
+    if not use-utci? [ set utci-cost link-weight ]
+
+    ;; thermal discomfort integral and routing weight (emphasizes hotspots)
+    if use-utci? [
+      let exceed max (list 0 (avg-utci - utci-discomfort-threshold))
+      set discomfort-excess ((exceed ^ utci-discomfort-power) * link-weight)
+
+      ;; increase discomfort penalty for unshaded daytime links (only when shadow effects are enabled)
+      ;; continuous sun penalty: intensity = sun-penalty-alpha * sun-factor * (exposure ^ shadow-exposure-gamma)
+      ;; - exposure = 1 - shadow-weight (0~1),larger under stronger exposure; avoids threshold jumps around shadow=0.49/0.51
+      ;; - sun-factor derived from sun-altitude-deg (default daylight=45, night=0)
+      if use-shadow? and daylight? [
+        let exposure max (list 0 (1 - shadow-weight))
+        set discomfort-excess discomfort-excess * (1 + (sun-penalty-alpha * sun-factor * (exposure ^ shadow-exposure-gamma)))
+      ]
+
+      ;; discomfort-cost:weight used by dijkstra (distance + discomfort penalty)
+      set discomfort-cost (link-weight + utci-discomfort-alpha * discomfort-excess)
+    ]
+    if not use-utci? [
+      set discomfort-excess 0
+      set discomfort-cost link-weight
+    ]
+
+    ;; combined-weight  comfort  update-comfort-candidate-weights
+  ]
+
+  ;; update multi-candidate comfort weights
+  update-comfort-candidate-weights
+
+  ;; calculate UTCI range using only directly sampled values; skip if UTCI is off
+  if use-utci? [ calculate-utci-range ]
+  if not use-utci? [ set min-utci 0 set max-utci 0 ]
+  if use-utci? [
+    let sampled-utci [utci-value] of nodes with [utci-valid? and (not utci-imputed?)]
+    ifelse empty? sampled-utci
+    [ show "UTCI range (direct samples only): none" ]
+    [ show (word "UTCI range (direct samples only): " (min sampled-utci) "" (max sampled-utci)) ]
+
+    ;; count imputed UTCI values for diagnosis
+    let imputedN count nodes with [utci-imputed?]
+    if imputedN > 0 [
+      show (word "Number of UTCI-imputed/fallback nodes: " imputedN)
+    ]
+  ]
+  if not use-utci? [ show "UTCI disabled: skip UTCI range/imputation diagnostics" ]
+end
+
+
+; ================== calculate UTCI range ==================
+to calculate-utci-range
+  ;; only measure directly sampled UTCI values for data-quality diagnosis
+  let utci-values [utci-value] of nodes with [utci-valid? and (not utci-imputed?)]
+
+  ifelse empty? utci-values [
+    set min-utci 0
+    set max-utci 0
+    show "Warning: no directly sampled UTCI values are available for range calculation"
+  ] [
+    set min-utci min utci-values
+    set max-utci max utci-values
+    show (word "UTCI(): " min-utci "" max-utci)
+  ]
+end
+
+
+
+; ================== walking logic ==================
+to go
+  ;; walking logic:
+  ;; -  tick  walk-speed-mps (m/s)  world-unit
+  ;; - hit-threshold ""
+
+  if (not is-number? gis-unit-per-patch) or (gis-unit-per-patch <= 0) [ update-gis-scale ]
+  let v (ifelse-value (is-number? walk-speed-mps and walk-speed-mps > 0) [walk-speed-mps] [1.5])
+
+  ;; m/s -> world-unit/tick
+  let step (v / gis-unit-per-patch)
+  let hit-threshold (step * 0.6)
+
+  ask commuters with [status = "walking"] [
+    if path-index < length commuter-path [
+      let target item path-index commuter-path
+      if target != nobody [
+        let dist-to-target distance target
+
+        if dist-to-target <= hit-threshold [
+          move-to target
+          set path-index path-index + 1
+
+          if path-index >= length commuter-path [
+            set status "arrived"
+          ]
+        ]
+        if dist-to-target > hit-threshold [
+          facexy [xcor] of target [ycor] of target
+          forward step
+        ]
+      ]
+    ]
+  ]
+
+  tick
+
+  ;; ,
+  if all? commuters [status = "arrived"] [
+    advance-to-next-time
+  ]
+end
+
+
+; ================== advance to the next time slot ==================
+to advance-to-next-time
+  set current-time-index (current-time-index + 1)
+
+  if current-time-index < length time-slots [
+    set current-time-slot item current-time-index time-slots
+
+    ifelse is-morning-slot? current-time-slot
+      [ set simulation-phase "morning" ]
+      [ set simulation-phase "evening" ]
+  ]
+end
+to reset-commuters-for-next-time
+  ;
+  load-current-time-data
+
+  ask commuters [
+    set status "waiting"
+    set path-index 0
+    set travel-time 0
+    set distance-traveled 0
+
+    ; reset to the origin based on current trip direction
+    if trip-dir = "to_work" [
+      let station-xy safe-xy gis:centroid-of metro-id
+      if station-xy != nobody [
+        setxy item 0 station-xy item 1 station-xy
+      ]
+    ]
+    if trip-dir = "to_home" [
+      let office-xy safe-xy gis:centroid-of office-id
+      if office-xy != nobody [
+        setxy item 0 office-xy item 1 office-xy
+      ]
+    ]
+    set color green
+    set shape "person"
+    set size 0.7
+    set label ""
+
+    ; randomly choose a path type
+    let path-choice random 3
+    if path-choice = 0 [
+      set commuter-path shortest-path
+      set current-path-type "shortest"
+    ]
+    if path-choice = 1 [
+      set commuter-path min-utci-path
+      set current-path-type "min_utci"
+    ]
+    if path-choice = 2 [
+      set commuter-path min-shadow-path
+      set current-path-type "min_shadow"
+    ]
+
+    set status "walking"
+
+    ; display the current path
+    ask links with [color != white - 3] [
+      set color white - 3
+      set hidden? true
+      set thickness 0.1
+    ]
+
+    let path-color blue
+    if current-path-type = "shortest" [ set path-color blue ]
+    if current-path-type = "min_utci" [ set path-color green ]
+    if current-path-type = "min_shadow" [ set path-color orange ]
+
+    if length commuter-path > 1 [
+      let node-reset-first first commuter-path
+      foreach but-first commuter-path [ node-reset-b ->
+        if (node-reset-first != nobody and node-reset-b != nobody and
+            node-reset-first != node-reset-b) [
+          let the-link [link-with node-reset-b] of node-reset-first
+          if the-link != nobody [
+            ask the-link [
+              set color path-color
+              set thickness 0.4
+              set hidden? false
+            ]
+          ]
+        ]
+        set node-reset-first node-reset-b
+      ]
+    ]
+
+    ; recompute statistics
+    let total-distance 0
+    let total-utci 0
+    let total-shadow 0
+    let path-length length commuter-path
+
+    if path-length > 1 [
+      let node-reset-stat-first first commuter-path
+      foreach but-first commuter-path [ node-reset-stat-b ->
+        if (node-reset-stat-first != nobody and node-reset-stat-b != nobody) [
+          let the-link [link-with node-reset-stat-b] of node-reset-stat-first
+          if the-link != nobody [
+            let edge-distance [link-weight] of the-link
+            set total-distance total-distance + edge-distance
+
+            let utci1 [utci-value] of node-reset-stat-first
+            let utci2 [utci-value] of node-reset-stat-b
+            let avg-utci (utci1 + utci2) / 2
+            set total-utci total-utci + (avg-utci * edge-distance)
+
+            let edge-shadow [shadow-weight] of the-link
+            set total-shadow total-shadow + (edge-shadow * edge-distance)
+          ]
+        ]
+        set node-reset-stat-first node-reset-stat-b
+      ]
+    ]
+
+    set distance-traveled total-distance
+    let v0 personal-walk-speed-mps
+    if (not is-number? v0) or (v0 <= 0) [ set v0 walk-speed-mps ]
+    set travel-time total-distance / v0
+    if total-distance > 0 [
+      set total-utci-exposure total-utci / total-distance
+      set total-shadow-exposure total-shadow / total-distance
+    ]
+  ]
+
+  ; ================== UTCI ==================
+  if min-utci != max-utci [
+    ask nodes [
+      set hidden? true
+      set size 0
+    ]
+  ]
+
+  ;
+  let legend-x min-pxcor + 1
+  let legend-y max-pycor - 1
+
+  let color-steps 10
+  let step-counter 0
+  while [step-counter < color-steps] [
+    let patch-x legend-x + step-counter
+    ask patch patch-x legend-y [
+      let color-value 10 + (step-counter * 130 / color-steps)
+      set pcolor color-value
+      set plabel-color white
+    ]
+    set step-counter step-counter + 1
+  ]
+
+  ask patch legend-x (legend-y - 1) [
+    set plabel "UTCI exposure legend"
+    set plabel-color white
+  ]
+
+  ask patch legend-x legend-y [
+    set plabel (word min-utci)
+    set plabel-color white
+  ]
+
+  ask patch (legend-x + color-steps - 1) legend-y [
+    set plabel (word max-utci)
+    set plabel-color white
+  ]
+end
+
+; ================== switch commuter path type ==================
+to switch-commuter-path [path-type]
+  ask commuters with [status = "walking"] [
+    if path-type = "shortest" and length shortest-path > 0 [
+      set commuter-path shortest-path
+      set current-path-type "shortest"
+      set path-index 0
+
+      ; display the current path
+      ask links with [color != white - 3] [
+        set color white - 3
+        set hidden? true
+        set thickness 0.1
+      ]
+
+      let path-color blue
+      if length commuter-path > 1 [
+        let node-switch-first first commuter-path
+        foreach but-first commuter-path [ node-switch-b ->
+          if (node-switch-first != nobody and node-switch-b != nobody and
+              node-switch-first != node-switch-b) [
+            let the-link [link-with node-switch-b] of node-switch-first
+            if the-link != nobody [
+              ask the-link [
+                set color path-color
+                set thickness 0.4
+                set hidden? false
+              ]
+            ]
+          ]
+          set node-switch-first node-switch-b
+        ]
+      ]
+
+      ; recompute statistics
+      let total-distance 0
+      let total-utci 0
+      let total-shadow 0
+      let path-length length commuter-path
+
+      if path-length > 1 [
+        let node-switch-stat-first first commuter-path
+        foreach but-first commuter-path [ node-switch-stat-b ->
+          if (node-switch-stat-first != nobody and node-switch-stat-b != nobody) [
+            let the-link [link-with node-switch-stat-b] of node-switch-stat-first
+            if the-link != nobody [
+              let edge-distance [link-weight] of the-link
+              set total-distance total-distance + edge-distance
+
+              let utci1 [utci-value] of node-switch-stat-first
+              let utci2 [utci-value] of node-switch-stat-b
+              let avg-utci (utci1 + utci2) / 2
+              set total-utci total-utci + (avg-utci * edge-distance)
+
+              let edge-shadow [shadow-weight] of the-link
+              set total-shadow total-shadow + (edge-shadow * edge-distance)
+            ]
+          ]
+          set node-switch-stat-first node-switch-stat-b
+        ]
+      ]
+
+      set distance-traveled total-distance
+      let v0 personal-walk-speed-mps
+    if (not is-number? v0) or (v0 <= 0) [ set v0 walk-speed-mps ]
+    set travel-time total-distance / v0
+      if total-distance > 0 [
+        set total-utci-exposure total-utci / total-distance
+        set total-shadow-exposure total-shadow / total-distance
+      ]
+    ]
+
+    if path-type = "min_utci" and length min-utci-path > 0 [
+      set commuter-path min-utci-path
+      set current-path-type "min_utci"
+      set path-index 0
+
+      ; display the current path
+      ask links with [color != white - 3] [
+        set color white - 3
+        set hidden? true
+        set thickness 0.1
+      ]
+
+      let path-color green
+      if length commuter-path > 1 [
+        let node-switch-utci-first first commuter-path
+        foreach but-first commuter-path [ node-switch-utci-b ->
+          if (node-switch-utci-first != nobody and node-switch-utci-b != nobody and
+              node-switch-utci-first != node-switch-utci-b) [
+            let the-link [link-with node-switch-utci-b] of node-switch-utci-first
+            if the-link != nobody [
+              ask the-link [
+                set color path-color
+                set thickness 0.4
+                set hidden? false
+              ]
+            ]
+          ]
+          set node-switch-utci-first node-switch-utci-b
+        ]
+      ]
+
+      ; recompute statistics
+      let total-distance 0
+      let total-utci 0
+      let total-shadow 0
+      let path-length length commuter-path
+
+      if path-length > 1 [
+        let node-switch-utci-stat-first first commuter-path
+        foreach but-first commuter-path [ node-switch-utci-stat-b ->
+          if (node-switch-utci-stat-first != nobody and node-switch-utci-stat-b != nobody) [
+            let the-link [link-with node-switch-utci-stat-b] of node-switch-utci-stat-first
+            if the-link != nobody [
+              let edge-distance [link-weight] of the-link
+              set total-distance total-distance + edge-distance
+
+              let utci1 [utci-value] of node-switch-utci-stat-first
+              let utci2 [utci-value] of node-switch-utci-stat-b
+              let avg-utci (utci1 + utci2) / 2
+              set total-utci total-utci + (avg-utci * edge-distance)
+
+              let edge-shadow [shadow-weight] of the-link
+              set total-shadow total-shadow + (edge-shadow * edge-distance)
+            ]
+          ]
+          set node-switch-utci-stat-first node-switch-utci-stat-b
+        ]
+      ]
+
+      set distance-traveled total-distance
+      let v0 personal-walk-speed-mps
+    if (not is-number? v0) or (v0 <= 0) [ set v0 walk-speed-mps ]
+    set travel-time total-distance / v0
+      if total-distance > 0 [
+        set total-utci-exposure total-utci / total-distance
+        set total-shadow-exposure total-shadow / total-distance
+      ]
+    ]
+
+    if path-type = "min_shadow" and length min-shadow-path > 0 [
+      set commuter-path min-shadow-path
+      set current-path-type "min_shadow"
+      set path-index 0
+
+      ; display the current path
+      ask links with [color != white - 3] [
+        set color white - 3
+        set hidden? true
+        set thickness 0.1
+      ]
+
+      let path-color orange
+      if length commuter-path > 1 [
+        let node-switch-shadow-first first commuter-path
+        foreach but-first commuter-path [ node-switch-shadow-b ->
+          if (node-switch-shadow-first != nobody and node-switch-shadow-b != nobody and
+              node-switch-shadow-first != node-switch-shadow-b) [
+            let the-link [link-with node-switch-shadow-b] of node-switch-shadow-first
+            if the-link != nobody [
+              ask the-link [
+                set color path-color
+                set thickness 0.4
+                set hidden? false
+              ]
+            ]
+          ]
+          set node-switch-shadow-first node-switch-shadow-b
+        ]
+      ]
+
+      ; recompute statistics
+      let total-distance 0
+      let total-utci 0
+      let total-shadow 0
+      let path-length length commuter-path
+
+      if path-length > 1 [
+        let node-switch-shadow-stat-first first commuter-path
+        foreach but-first commuter-path [ node-switch-shadow-stat-b ->
+          if (node-switch-shadow-stat-first != nobody and node-switch-shadow-stat-b != nobody) [
+            let the-link [link-with node-switch-shadow-stat-b] of node-switch-shadow-stat-first
+            if the-link != nobody [
+              let edge-distance [link-weight] of the-link
+              set total-distance total-distance + edge-distance
+
+              let utci1 [utci-value] of node-switch-shadow-stat-first
+              let utci2 [utci-value] of node-switch-shadow-stat-b
+              let avg-utci (utci1 + utci2) / 2
+              set total-utci total-utci + (avg-utci * edge-distance)
+
+              let edge-shadow [shadow-weight] of the-link
+              set total-shadow total-shadow + (edge-shadow * edge-distance)
+            ]
+          ]
+          set node-switch-shadow-stat-first node-switch-shadow-stat-b
+        ]
+      ]
+
+      set distance-traveled total-distance
+      let v0 personal-walk-speed-mps
+    if (not is-number? v0) or (v0 <= 0) [ set v0 walk-speed-mps ]
+    set travel-time total-distance / v0
+      if total-distance > 0 [
+        set total-utci-exposure total-utci / total-distance
+        set total-shadow-exposure total-shadow / total-distance
+      ]
+    ]
+  ]
+end
+
+; ================== export statistics ==================
+to export-statistics
+  ;; export statistics for the current path type
+  ;; also include fields required for Python post-processing:od_id / time_slot / path_sig / path_type / avg_utci
+  let time-tag replace-string current-time-slot ":""-"
+  let filename (word "C:/Users/31268/Desktop/path_comparison_" time-tag "_" current-path-type ".csv")
+
+  if file-exists? filename [
+    file-delete filename
+  ]
+
+  file-open filename
+  file-print "od_id,time_slot,path_sig,path_type,avg_utci,ID,ID,ID,,,,UTCI,"
+
+  ask commuters [
+    let od-id build-od-id trip-dir metro-no office-no
+    let sig path-signature commuter-path
+    file-print (word od-id "," current-time-slot "," sig "," current-path-type ","
+                (precision total-utci-exposure 2) ","
+                who "," office-no "," metro-no "," current-path-type ","
+                (precision distance-traveled 4) ","
+                (precision travel-time 2) ","
+                (precision total-utci-exposure 2) ","
+                (precision total-shadow-exposure 2))
+  ]
+
+  file-close
+  show (word "Statistics exported to: " filename)
+end
+
+
+; ================== clear path display ==================
+to clear-path-display
+  ask links [
+    if color != white - 3 [
+      set color white - 3
+      set thickness 0.1
+      set hidden? true
+    ]
+  ]
+end
+
+; =====================================================
+; compute path metrics: total distance, travel time, average UTCI, average shadow
+; path is a list of nodes
+; =====================================================
+to-report path-thermal-metrics [path]
+  ;; extended metrics used to assess significant reduction in thermal discomfort
+  ;; returns: [total distance (m) travel time (s) avg UTCI avg shadow discomfort integral peak UTCI hot distance (m)]
+  ;; discomfort integral: sum(max(0,UTCI-threshold)^power * distance * daytime unshaded penalty)
+
+  if (not is-list? path) or (length path < 2) [
+    report (list 0 0 0 0 0 0 0)
+  ]
+
+  ;; speed fallback
+  let v (ifelse-value (is-number? walk-speed-mps and walk-speed-mps > 0) [walk-speed-mps] [1.5])
+  ;; UTCI fallback value in case utci-fill-value is not yet initialized
+  let fill (ifelse-value is-number? utci-fill-value [utci-fill-value] [utci-discomfort-threshold])
+
+  let total-distance 0
+  let total-utci 0
+  let total-shadow 0
+
+  let total-discomfort 0
+  let path-max-utci -1.0e9
+  let hot-distance 0
+
+  let a first path
+  foreach but-first path [ b ->
+    if (a != nobody and b != nobody) [
+      let lk ([link-with b] of a)
+      if lk != nobody [
+        let d [link-weight] of lk
+        if not is-number? d [ set d 0 ]
+        set total-distance total-distance + d
+
+        let u1 [utci-value] of a
+        let u2 [utci-value] of b
+        if not is-number? u1 [ set u1 fill ]
+        if not is-number? u2 [ set u2 fill ]
+        ;; if UTCI is disabled, treat UTCI as a constant fill value
+        if not use-utci? [
+          set u1 fill
+          set u2 fill
+        ]
+        let uavg (u1 + u2) / 2
+
+        let s [shadow-weight] of lk
+        if not is-number? s [ set s 0 ]
+        ;; if shadow is disabled, treat every link as fully shaded (=1)
+        if not use-shadow? [ set s 1 ]
+
+        set total-utci total-utci + (uavg * d)
+        set total-shadow total-shadow + (s * d)
+
+        if uavg > path-max-utci [ set path-max-utci uavg ]
+        if use-utci? and (uavg > utci-discomfort-threshold) [ set hot-distance hot-distance + d ]
+
+        let ex 0
+        if use-utci? [
+          let exceed max (list 0 (uavg - utci-discomfort-threshold))
+          set ex (exceed ^ utci-discomfort-power) * d
+          ;; ""
+           ;; ():keep consistent with update-link-weights
+           if use-shadow? and daylight? [
+             let exposure max (list 0 (1 - s))
+             set ex ex * (1 + (sun-penalty-alpha * sun-factor * (exposure ^ shadow-exposure-gamma)))
+           ]
+        ]
+        set total-discomfort total-discomfort + ex
+      ]
+    ]
+    set a b
+  ]
+
+  let avg-utci-exposure 0
+  let avg-shadow-exposure 0
+  if total-distance > 0 [
+    set avg-utci-exposure total-utci / total-distance
+    set avg-shadow-exposure total-shadow / total-distance
+  ]
+
+  let tt 0
+  if total-distance > 0 [ set tt (total-distance / v) ]
+
+  if path-max-utci < -1.0e8 [ set path-max-utci 0 ]
+
+  report (list total-distance tt avg-utci-exposure avg-shadow-exposure total-discomfort path-max-utci hot-distance)
+end
+
+
+
+to-report path-metrics [path]
+  ;; : [(m) (s) UTCI ]
+  if (not is-list? path) or (length path < 2) [
+    report (list 0 0 0 0)
+  ]
+
+  let v (ifelse-value (is-number? walk-speed-mps and walk-speed-mps > 0) [walk-speed-mps] [1.5])
+  let fill (ifelse-value is-number? utci-fill-value [utci-fill-value] [utci-discomfort-threshold])
+
+  let total-distance 0
+  let total-utci 0
+  let total-shadow 0
+
+  let a first path
+  foreach but-first path [ b ->
+    if (a != nobody and b != nobody) [
+      let lk ([link-with b] of a)
+      if lk != nobody [
+        let d [link-weight] of lk
+        if not is-number? d [ set d 0 ]
+        set total-distance total-distance + d
+
+        let u1 [utci-value] of a
+        let u2 [utci-value] of b
+        if not is-number? u1 [ set u1 fill ]
+        if not is-number? u2 [ set u2 fill ]
+        let avg-utci (u1 + u2) / 2
+        set total-utci total-utci + (avg-utci * d)
+
+        let s [shadow-weight] of lk
+        if not is-number? s [ set s 0 ]
+        set total-shadow total-shadow + (s * d)
+      ]
+    ]
+    set a b
+  ]
+
+  let avg-utci-exposure 0
+  let avg-shadow-exposure 0
+  if total-distance > 0 [
+    set avg-utci-exposure total-utci / total-distance
+    set avg-shadow-exposure total-shadow / total-distance
+  ]
+
+  let tt 0
+  if total-distance > 0 [ set tt (total-distance / v) ]
+
+  report (list total-distance tt avg-utci-exposure avg-shadow-exposure)
+end
+
+
+
+; =====================================================
+;  CSV
+; =====================================================
+
+to-report build-od-id [trip-direction metro-id-num office-id-num]
+  ;; generate a stable OD identifier for Python post-processing:
+  ;; - morning peak: to_work_M1_O12
+  ;; - evening peak: to_home_O12_M1
+  if trip-direction = "to_work" [
+    report (word "to_work_M" metro-id-num "_O" office-id-num)
+  ]
+  if trip-direction = "to_home" [
+    report (word "to_home_O" office-id-num "_M" metro-id-num)
+  ]
+  report (word "OD_M" metro-id-num "_O" office-id-num)
+end
+
+to-report path-signature [path]
+  ;; output a path signature so Python can compare actual node sequences
+  ;; example format: 12-58-77-103
+  if (not is-list? path) or empty? path [
+    report ""
+  ]
+
+  let sig ""
+  let first-node? true
+
+  foreach path [ nd ->
+    let piece "NA"
+    if nd != nobody [
+      set piece [who] of nd
+    ]
+
+    ifelse first-node? [
+      set sig (word piece)
+      set first-node? false
+    ] [
+      set sig (word sig "-" piece)
+    ]
+  ]
+
+  report sig
+end
+
+to-report csv-active-type [route-family chosen-type]
+  ;; only actively selected routes need to store the underlying candidate type
+  if route-family = "min_utci" [
+    if is-string? chosen-type [ report chosen-type ]
+  ]
+  report ""
+end
+
+
+to-report heat-class-from-metrics [m]
+  ;; classify paths as OK / HOT based on discomfort and threshold
+  ;; m = path-thermal-metrics outputs: [dist time avgUTCI avgShade discomfort peakUTCI hotDist]
+  if (not is-list? m) or (length m < 7) [ report "NA" ]
+
+  let avg item 2 m
+  let peak item 5 m
+  let dis item 4 m
+
+  if (is-number? dis) and (dis > 0) [ report "HOT" ]
+  if (is-number? peak) and (peak > utci-discomfort-threshold) [ report "HOT" ]
+  if (is-number? avg) and (avg > utci-discomfort-threshold) [ report "HOT" ]
+
+  report "OK"
+end
+
+to export-3paths-csv-to-desktop
+  ;; export one CSV per time slot and write slot/class labels on each row
+  ;; for Python post-processing, also include:
+  ;; - od_id
+  ;; - time_slot
+  ;; - path_sig
+  ;; - path_type
+  ;; - avg_utci
+
+  let safe-time current-time-slot
+  set safe-time (replace-string safe-time ":""-")
+  let filename (word "C:/Users/31268/Desktop/path_comparison_" scenario-id "_" safe-time ".csv")
+
+  if file-exists? filename [ file-delete filename ]
+  file-open filename
+  ;; UTF-8 BOM:Excel
+  file-type ""
+
+  file-print "od_id,time_slot,path_sig,path_type,avg_utci,active_type,commuter_id,trip_dir,light_class,scenario_id,use_shadow,use_utci,detour_max,utci_threshold,utci_alpha,utci_power,sun_alpha,improve_ratio,improve_abs,office_id,metro_id,distance_m,travel_time_s,avg_shadow,discomfort_sum,peak_utci,hot_distance_m,heat_class,personal_speed_mps,departure_delay_sec,personal_utci_threshold,pref_dist,pref_heat,pref_shade,slot_label,trip_direction_label,light_label,scenario_label,route_label,route_distance_m,route_travel_time_s,route_avg_utci,route_avg_shadow,route_discomfort_sum,route_peak_utci,route_hot_distance_m,route_heat_class,route_active_type"
+
+  ask commuters [
+    let t current-time-slot
+    let dir trip-dir
+    let light light-class
+    let od-id build-od-id dir metro-no office-no
+
+    ;; 1) shortest route
+    let m1 path-thermal-metrics shortest-path
+    let sig1 path-signature shortest-path
+    file-print (word od-id "," t "," sig1 ",shortest,"
+      (precision item 2 m1 3) ",,"
+      who "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," office-no "," metro-no ","
+      (precision item 0 m1 6) "," (precision item 1 m1 3) "," (precision item 3 m1 3) ","
+      (precision item 4 m1 6) "," (precision item 5 m1 3) "," (precision item 6 m1 6) "," (heat-class-from-metrics m1) ","
+      t "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," who "," office-no "," metro-no ",shortest route,"
+      (precision item 0 m1 6) "," (precision item 1 m1 3) "," (precision item 2 m1 3) "," (precision item 3 m1 3) ","
+      (precision item 4 m1 6) "," (precision item 5 m1 3) "," (precision item 6 m1 6) "," (heat-class-from-metrics m1) ",")
+
+    ;; 2) active selection (best candidate within budget that significantly reduces discomfort)
+    let m2 path-thermal-metrics min-utci-path
+    let sig2 path-signature min-utci-path
+    let active-type csv-active-type "min_utci" current-path-type
+    file-print (word od-id "," t "," sig2 ",min_utci,"
+      (precision item 2 m2 3) "," active-type ","
+      who "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," office-no "," metro-no ","
+      (precision item 0 m2 6) "," (precision item 1 m2 3) "," (precision item 3 m2 3) ","
+      (precision item 4 m2 6) "," (precision item 5 m2 3) "," (precision item 6 m2 6) "," (heat-class-from-metrics m2) ","
+      t "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," who "," office-no "," metro-no ",active selection,"
+      (precision item 0 m2 6) "," (precision item 1 m2 3) "," (precision item 2 m2 3) "," (precision item 3 m2 3) ","
+      (precision item 4 m2 6) "," (precision item 5 m2 3) "," (precision item 6 m2 6) "," (heat-class-from-metrics m2) "," personal-walk-speed-mps "," departure-delay-sec "," personal-utci-threshold "," (precision pref-dist 4) "," (precision pref-heat 4) "," (precision pref-shade 4) "," t "," dir "," light "," scenario-id ",active selection,"
+      (precision item 0 m2 6) "," (precision item 1 m2 3) "," (precision item 2 m2 3) "," (precision item 3 m2 3) ","
+      (precision item 4 m2 6) "," (precision item 5 m2 3) "," (precision item 6 m2 6) "," (heat-class-from-metrics m2) "," active-type)
+
+    ;; 3) maximum shade(shortest route,)
+    let m3 path-thermal-metrics min-shadow-path
+    let sig3 path-signature min-shadow-path
+    file-print (word od-id "," t "," sig3 ",min_shadow,"
+      (precision item 2 m3 3) ",,"
+      who "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," office-no "," metro-no ","
+      (precision item 0 m3 6) "," (precision item 1 m3 3) "," (precision item 3 m3 3) ","
+      (precision item 4 m3 6) "," (precision item 5 m3 3) "," (precision item 6 m3 6) "," (heat-class-from-metrics m3) ","
+      t "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," who "," office-no "," metro-no ",maximum shade,"
+      (precision item 0 m3 6) "," (precision item 1 m3 3) "," (precision item 2 m3 3) "," (precision item 3 m3 3) ","
+      (precision item 4 m3 6) "," (precision item 5 m3 3) "," (precision item 6 m3 6) "," (heat-class-from-metrics m3) "," personal-walk-speed-mps "," departure-delay-sec "," personal-utci-threshold "," (precision pref-dist 4) "," (precision pref-heat 4) "," (precision pref-shade 4) "," t "," dir "," light "," scenario-id ",maximum shade,"
+      (precision item 0 m3 6) "," (precision item 1 m3 3) "," (precision item 2 m3 3) "," (precision item 3 m3 3) ","
+      (precision item 4 m3 6) "," (precision item 5 m3 3) "," (precision item 6 m3 6) "," (heat-class-from-metrics m3) "," )
+  ]
+
+  file-close
+  show (word "CSV exported to desktop: " filename)
+end
+
+; after weights change for a time slot, recompute all three path families
+to recompute-paths-for-current-time
+  ;; before recomputation, ensure OD-to-node mapping is valid
+  update-commuter-od-nodes
+  recompute-commuter-3paths
+end
+
+to export-19-20-to-desktop
+  init-active-selection-params
+  ensure-comfort-weight-sets
+
+  if (not is-list? time-slots) or empty? time-slots [
+    setup-time-slots
+  ]
+  setup-utci-file-map
+
+  let target-times build-time-slots "19:00""20:00" 10
+  let failures []
+
+  foreach target-times [ ts ->
+    show (word "===== : " ts " =====")
+    set current-time-slot ts
+
+    let idx position ts time-slots
+    if idx != false [ set current-time-index idx ]
+
+    ifelse is-morning-slot? ts [
+      set simulation-phase "morning"
+    ] [
+      set simulation-phase "evening"
+    ]
+
+    carefully [
+      load-current-time-data
+      show (word ts "")
+      recompute-paths-for-current-time
+      show (word ts "")
+      export-3paths-csv-to-desktop
+      show (word ts " CSV")
+    ] [
+      show (word "" ts " ,: " error-message)
+      set failures lput ts failures
+    ]
+  ]
+
+  ifelse empty? failures
+  [ show "10-minute CSV files for 19:00-20:00 have been exported to the desktop." ]
+  [ show (word "The following time slots failed to export: " failures) ]
+end
+to clip-network-to-zone
+  ;; zone is the site boundary; nodes and links outside it are removed
+  if zone-data = nobody [
+    show ":zone-data not loaded; skipping clipping"
+    stop
+  ]
+
+  let zone-features gis:feature-list-of zone-data
+  if empty? zone-features [
+    show ":zone-data has no features; skipping clipping"
+    stop
+  ]
+  let zone-poly first zone-features
+
+  ;; 1) remove nodes outside the zone
+  ask nodes [
+    let pt (list xcoord ycoord)
+    if not gis:intersects? zone-poly pt [
+      die
+    ]
+  ]
+
+  ;; 2) remove links whose endpoints are missing or no longer in the node set
+  ask links [
+    if (end1 = nobody) or (end2 = nobody) [ die ]
+    if (not member? end1 nodes) or (not member? end2 nodes) [ die ]
+  ]
+
+  show (word "After clipping: nodes=" count nodes ", =" count links)
+end
+
+; =====================================================
+; recompute each commuter's three paths when time-dependent weights change
+; =====================================================
+to recompute-commuter-3paths
+  ;; :
+  ;; 1) (link-weight)
+  ;; 2) active selection:
+  ;; 3) maximum shade(;shortest route)
+
+  ;; key robustness improvements:
+  ;; - if start/end node references are invalid, first remap using cached OD coordinates
+  ;; - when falling back to centroids, respect the current trip direction
+  ;; - avoid all-zero batch exports caused by invalid GIS feature handles
+
+  ask commuters [
+    ;; 1) self-healing: if nodes are lost, try to remap using cached coordinates
+    if (commuter-start-node = nobody) or (commuter-end-node = nobody) [
+      if od-valid? [
+        set commuter-start-node min-one-of nodes [ distancexy ([start-x] of myself) ([start-y] of myself) ]
+        set commuter-end-node   min-one-of nodes [ distancexy ([end-x] of myself)   ([end-y] of myself) ]
+      ]
+    ]
+
+    ;; 2) fallback: if cached mapping fails, derive centroids from GIS features and rebuild OD by trip direction
+    if (commuter-start-node = nobody) or (commuter-end-node = nobody) [
+      let station-xy safe-xy gis:centroid-of metro-id
+      let office-xy  safe-xy gis:centroid-of office-id
+
+      if (station-xy != nobody) and (office-xy != nobody) [
+        set metro-x item 0 station-xy
+        set metro-y item 1 station-xy
+        set office-x item 0 office-xy
+        set office-y item 1 office-xy
+
+        if trip-dir = "to_work" [
+          set start-x metro-x
+          set start-y metro-y
+          set end-x   office-x
+          set end-y   office-y
+        ]
+        if trip-dir = "to_home" [
+          set start-x office-x
+          set start-y office-y
+          set end-x   metro-x
+          set end-y   metro-y
+        ]
+
+        set od-valid? true
+        set commuter-start-node min-one-of nodes [ distancexy ([start-x] of myself) ([start-y] of myself) ]
+        set commuter-end-node   min-one-of nodes [ distancexy ([end-x] of myself)   ([end-y] of myself) ]
+      ]
+    ]
+
+    ;; 3) if still invalid, leave paths empty (CSV will output zeros)
+    ifelse (commuter-start-node = nobody) or (commuter-end-node = nobody) [
+      set shortest-path []
+      set min-utci-path []
+      set min-shadow-path []
+      set current-path-type "invalid"
+    ] [
+      ;; (1) shortest-distance path
+      set shortest-path compute-dijkstra commuter-start-node commuter-end-node "link-weight"
+
+      ;; (2) active selection:
+      let chosen choose-best-comfort-path commuter-start-node commuter-end-node shortest-path
+      set min-utci-path item 0 chosen
+      set current-path-type item 1 chosen
+
+      ;; (3) maximum shade:;( 0 )
+      ifelse daylight? [
+        set min-shadow-path compute-dijkstra commuter-start-node commuter-end-node "shadow-cost"
+      ] [
+        set min-shadow-path shortest-path
+      ]
+    ]
+  ]
+end
+
+
+
+; =====================================================
+; export CSVs for all time slots and all three path families to the desktop
+; usage: run setup first (or click the shp button), then run this procedure
+; =====================================================
+to export-all-time-slots-3paths-to-desktop
+  if empty? time-slots [
+    setup-time-slots
+  ]
+
+  foreach time-slots [ t ->
+    set current-time-slot t
+
+    set current-time-index position t time-slots
+    ifelse is-morning-slot? t
+      [ set simulation-phase "morning" ]
+      [ set simulation-phase "evening" ]
+
+    load-current-time-data
+    update-commuter-od-nodes
+
+    recompute-commuter-3paths
+    export-3paths-csv-to-desktop
+  ]
+
+  show "CSV files for all time slots have been exported to the desktop."
+end
+to compute-components
+  ;; assign each node a connected-component id based on link-neighbors
+  ask nodes [ set comp-id -1 ]
+  let cid 0
+  while [ any? nodes with [ comp-id = -1 ] ] [
+    let seed one-of nodes with [ comp-id = -1 ]
+    ask seed [ set comp-id cid ]
+    let frontier (turtle-set seed)
+    while [ any? frontier ] [
+      let new-neigh (turtle-set [ link-neighbors ] of frontier) with [ comp-id = -1 ]
+      ifelse any? new-neigh [
+        ask new-neigh [ set comp-id cid ]
+        set frontier new-neigh
+      ] [
+        set frontier no-turtles
+      ]
+    ]
+    set cid cid + 1
+  ]
+end
+
+
+to connect-required-components
+  ;; bridge connected components that contain station/office access nodes so any OD pair is reachable
+  let required-nodes (turtle-set (map [pair -> item 1 pair] station-node-map)
+                                (map [pair -> item 1 pair] office-node-map))
+  if not any? required-nodes [ stop ]
+
+  let guard 0
+  while [guard < 50] [
+    set guard guard + 1
+    compute-components
+
+    let req-comps remove-duplicates [comp-id] of required-nodes
+    if length req-comps <= 1 [ stop ]
+
+    let main-comp first req-comps
+    let main-set nodes with [comp-id = main-comp]
+    let other-comps but-first req-comps
+
+    foreach other-comps [ c ->
+      let other-set nodes with [comp-id = c]
+      let bestA nobody
+      let bestB nobody
+      let bestD 1e18
+
+      ask other-set [
+        let a self
+        let b min-one-of main-set [ distancexy [xcor] of a [ycor] of a ]
+        if b != nobody [
+          let d distance-m ([xcor] of a) ([ycor] of a) ([xcor] of b) ([ycor] of b)
+          if d < bestD [
+            set bestD d
+            set bestA a
+            set bestB b
+          ]
+        ]
+      ]
+
+      if (bestA != nobody) and (bestB != nobody) [
+        ask bestA [
+          create-link-with bestB [
+            set link-weight bestD
+            set shadow-cost bestD
+            set utci-cost bestD
+            set discomfort-cost bestD
+            set combined-weight bestD
+            set time-weights []
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+
+; ================== scenario switches for counterfactual / ablation experiments ==================
+to set-experiment-scenario [sid]
+  ;; S0: all on (baseline scenario)
+  ;; S1: shadow off (UTCI only)
+  ;; S2: UTCI off (shadow only)
+  ;; S3: all off (geometry / distance only)
+  set scenario-id sid
+  if sid = "S0" [ set use-shadow? true  set use-utci? true  ]
+  if sid = "S1" [ set use-shadow? false set use-utci? true  ]
+  if sid = "S2" [ set use-shadow? true  set use-utci? false ]
+  if sid = "S3" [ set use-shadow? false set use-utci? false ]
+end
+
+; export all S0-S3 scenarios across all 10-minute slots
+to export-all-scenarios-7-times-to-desktop
+  init-active-selection-params
+  ensure-comfort-weight-sets
+  if not is-list? time-slots [ setup-time-slots ]
+
+  let scenarios ["S0""S1""S2""S3"]
+  foreach scenarios [ sid ->
+    set-experiment-scenario sid
+    show (word "Starting scenario: " sid " (use-shadow?=" use-shadow? ", use-utci?=" use-utci? ")")
+    foreach time-slots [ tt ->
+      set current-time-slot tt
+      show (word "Processing time slot: " tt)
+      ;; (+UTCI); use-shadow?/use-utci?
+      load-current-time-data
+      recompute-paths-for-current-time
+      export-3paths-csv-to-desktop
+    ]
+  ]
+end
+
+; ================== compatibility wrappers (optional) ==================
+to load-shadow-for-current-time
+  ;; compatibility wrapper: load and update through load-current-time-data
+  load-current-time-data
+end
+
+to load-utci-for-current-time
+  ;; compatibility wrapper: UTCI is already loaded in load-shadow-for-current-time / load-current-time-data
+end
+
+

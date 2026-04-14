@@ -1,0 +1,5 @@
+Files to upload to GitHub:
+1. netlogo.txt
+2. README.md
+3. LICENSE
+4. .gitignore
