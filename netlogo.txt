@@ -591,6 +591,19 @@ to ensure-comfort-weight-sets
   ]
 end
 
+to-report shortest-path-label
+  report "几何最短路径"
+end
+
+to-report sun-avoid-path-label
+  report "日照规避路径"
+end
+
+to-report heat-safe-path-label
+  report "累计热安全路径"
+end
+
+
 to init-commuter-heterogeneity
   ask commuters [
     ;; Walking speed heterogeneity: approximately 1.1 to 1.8 m/s
@@ -655,9 +668,9 @@ to-report choose-personal-path-type [c]
 
   let best-score min (list score1 score2 score3)
 
-  if best-score = score1 [ report "shortest" ]
-  if best-score = score2 [ report "min_utci" ]
-  report "min_shadow"
+  if best-score = score1 [ report shortest-path-label ]
+  if best-score = score2 [ report heat-safe-path-label ]
+  report sun-avoid-path-label
 end
 to setup-utci-file-map
   ;; 10-minute UTCI directory
@@ -1178,13 +1191,13 @@ set metro-stations load-dataset-fallback metro-path metro-path-alt "metro-statio
     set personal-path-type chosen-path-type
     set current-path-type chosen-path-type
 
-    if chosen-path-type = "shortest" [
+    if chosen-path-type = shortest-path-label [
       set commuter-path shortest-path
     ]
-    if chosen-path-type = "min_utci" [
+    if chosen-path-type = heat-safe-path-label [
       set commuter-path min-utci-path
     ]
-    if chosen-path-type = "min_shadow" [
+    if chosen-path-type = sun-avoid-path-label [
       set commuter-path min-shadow-path
     ]
 
@@ -1243,9 +1256,9 @@ set metro-stations load-dataset-fallback metro-path metro-path-alt "metro-statio
 
     ; set color by path type
     let path-color blue
-    if current-path-type = "shortest" [ set path-color blue ]
-    if current-path-type = "min_utci" [ set path-color green ]
-    if current-path-type = "min_shadow" [ set path-color orange ]
+    if current-path-type = shortest-path-label [ set path-color blue ]
+    if current-path-type = heat-safe-path-label [ set path-color green ]
+    if current-path-type = sun-avoid-path-label [ set path-color orange ]
 
     ;
     if length commuter-path > 1 [
@@ -1268,7 +1281,7 @@ set metro-stations load-dataset-fallback metro-path metro-path-alt "metro-statio
     ]
 
     ; store path types
-    set path-types ["shortest""min_utci""min_shadow"]
+    set path-types (list shortest-path-label heat-safe-path-label sun-avoid-path-label)
   ]
 
   ; display comparison of path types
@@ -2063,15 +2076,15 @@ to reset-commuters-for-next-time
     let path-choice random 3
     if path-choice = 0 [
       set commuter-path shortest-path
-      set current-path-type "shortest"
+      set current-path-type shortest-path-label
     ]
     if path-choice = 1 [
       set commuter-path min-utci-path
-      set current-path-type "min_utci"
+      set current-path-type heat-safe-path-label
     ]
     if path-choice = 2 [
       set commuter-path min-shadow-path
-      set current-path-type "min_shadow"
+      set current-path-type sun-avoid-path-label
     ]
 
     set status "walking"
@@ -2084,9 +2097,9 @@ to reset-commuters-for-next-time
     ]
 
     let path-color blue
-    if current-path-type = "shortest" [ set path-color blue ]
-    if current-path-type = "min_utci" [ set path-color green ]
-    if current-path-type = "min_shadow" [ set path-color orange ]
+    if current-path-type = shortest-path-label [ set path-color blue ]
+    if current-path-type = heat-safe-path-label [ set path-color green ]
+    if current-path-type = sun-avoid-path-label [ set path-color orange ]
 
     if length commuter-path > 1 [
       let node-reset-first first commuter-path
@@ -2187,9 +2200,9 @@ end
 ; ================== switch commuter path type ==================
 to switch-commuter-path [path-type]
   ask commuters with [status = "walking"] [
-    if path-type = "shortest" and length shortest-path > 0 [
+    if path-type = shortest-path-label and length shortest-path > 0 [
       set commuter-path shortest-path
-      set current-path-type "shortest"
+      set current-path-type shortest-path-label
       set path-index 0
 
       ; display the current path
@@ -2256,9 +2269,9 @@ to switch-commuter-path [path-type]
       ]
     ]
 
-    if path-type = "min_utci" and length min-utci-path > 0 [
+    if path-type = heat-safe-path-label and length min-utci-path > 0 [
       set commuter-path min-utci-path
-      set current-path-type "min_utci"
+      set current-path-type heat-safe-path-label
       set path-index 0
 
       ; display the current path
@@ -2325,9 +2338,9 @@ to switch-commuter-path [path-type]
       ]
     ]
 
-    if path-type = "min_shadow" and length min-shadow-path > 0 [
+    if path-type = sun-avoid-path-label and length min-shadow-path > 0 [
       set commuter-path min-shadow-path
-      set current-path-type "min_shadow"
+      set current-path-type sun-avoid-path-label
       set path-index 0
 
       ; display the current path
@@ -2626,8 +2639,8 @@ to-report path-signature [path]
 end
 
 to-report csv-active-type [route-family chosen-type]
-  ;; only actively selected routes need to store the underlying candidate type
-  if route-family = "min_utci" [
+  ;; only 累计热安全路径 needs to store the underlying candidate type
+  if route-family = heat-safe-path-label [
     if is-string? chosen-type [ report chosen-type ]
   ]
   report ""
@@ -2660,12 +2673,12 @@ to export-3paths-csv-to-desktop
   ;; - avg_utci
 
   let safe-time current-time-slot
-  set safe-time (replace-string safe-time ":""-")
+  set safe-time (replace-string safe-time ":" "-")
   let filename (word "C:/Users/31268/Desktop/path_comparison_" scenario-id "_" safe-time ".csv")
 
   if file-exists? filename [ file-delete filename ]
   file-open filename
-  ;; UTF-8 BOM:Excel
+  ;; UTF-8 BOM: Excel
   file-type ""
 
   file-print "od_id,time_slot,path_sig,path_type,avg_utci,active_type,commuter_id,trip_dir,light_class,scenario_id,use_shadow,use_utci,detour_max,utci_threshold,utci_alpha,utci_power,sun_alpha,improve_ratio,improve_abs,office_id,metro_id,distance_m,travel_time_s,avg_shadow,discomfort_sum,peak_utci,hot_distance_m,heat_class,personal_speed_mps,departure_delay_sec,personal_utci_threshold,pref_dist,pref_heat,pref_shade,slot_label,trip_direction_label,light_label,scenario_label,route_label,route_distance_m,route_travel_time_s,route_avg_utci,route_avg_shadow,route_discomfort_sum,route_peak_utci,route_hot_distance_m,route_heat_class,route_active_type"
@@ -2676,44 +2689,46 @@ to export-3paths-csv-to-desktop
     let light light-class
     let od-id build-od-id dir metro-no office-no
 
-    ;; 1) shortest route
+    ;; 1) 几何最短路径
     let m1 path-thermal-metrics shortest-path
     let sig1 path-signature shortest-path
-    file-print (word od-id "," t "," sig1 ",shortest,"
+    file-print (word od-id "," t "," sig1 "," shortest-path-label ","
       (precision item 2 m1 3) ",,"
       who "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," office-no "," metro-no ","
       (precision item 0 m1 6) "," (precision item 1 m1 3) "," (precision item 3 m1 3) ","
       (precision item 4 m1 6) "," (precision item 5 m1 3) "," (precision item 6 m1 6) "," (heat-class-from-metrics m1) ","
-      t "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," who "," office-no "," metro-no ",shortest route,"
+      t "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," who "," office-no "," metro-no "," shortest-path-label ","
       (precision item 0 m1 6) "," (precision item 1 m1 3) "," (precision item 2 m1 3) "," (precision item 3 m1 3) ","
       (precision item 4 m1 6) "," (precision item 5 m1 3) "," (precision item 6 m1 6) "," (heat-class-from-metrics m1) ",")
 
-    ;; 2) active selection (best candidate within budget that significantly reduces discomfort)
+    ;; 2) 累计热安全路径
     let m2 path-thermal-metrics min-utci-path
     let sig2 path-signature min-utci-path
-    let active-type csv-active-type "min_utci" current-path-type
-    file-print (word od-id "," t "," sig2 ",min_utci,"
+    let active-type csv-active-type heat-safe-path-label current-path-type
+    file-print (word od-id "," t "," sig2 "," heat-safe-path-label ","
       (precision item 2 m2 3) "," active-type ","
       who "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," office-no "," metro-no ","
       (precision item 0 m2 6) "," (precision item 1 m2 3) "," (precision item 3 m2 3) ","
       (precision item 4 m2 6) "," (precision item 5 m2 3) "," (precision item 6 m2 6) "," (heat-class-from-metrics m2) ","
-      t "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," who "," office-no "," metro-no ",active selection,"
+      t "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," who "," office-no "," metro-no "," heat-safe-path-label ","
       (precision item 0 m2 6) "," (precision item 1 m2 3) "," (precision item 2 m2 3) "," (precision item 3 m2 3) ","
-      (precision item 4 m2 6) "," (precision item 5 m2 3) "," (precision item 6 m2 6) "," (heat-class-from-metrics m2) "," personal-walk-speed-mps "," departure-delay-sec "," personal-utci-threshold "," (precision pref-dist 4) "," (precision pref-heat 4) "," (precision pref-shade 4) "," t "," dir "," light "," scenario-id ",active selection,"
+      (precision item 4 m2 6) "," (precision item 5 m2 3) "," (precision item 6 m2 6) "," (heat-class-from-metrics m2) ","
+      personal-walk-speed-mps "," departure-delay-sec "," personal-utci-threshold "," (precision pref-dist 4) "," (precision pref-heat 4) "," (precision pref-shade 4) "," t "," dir "," light "," scenario-id "," heat-safe-path-label ","
       (precision item 0 m2 6) "," (precision item 1 m2 3) "," (precision item 2 m2 3) "," (precision item 3 m2 3) ","
       (precision item 4 m2 6) "," (precision item 5 m2 3) "," (precision item 6 m2 6) "," (heat-class-from-metrics m2) "," active-type)
 
-    ;; 3) maximum shade(shortest route,)
+    ;; 3) 日照规避路径
     let m3 path-thermal-metrics min-shadow-path
     let sig3 path-signature min-shadow-path
-    file-print (word od-id "," t "," sig3 ",min_shadow,"
+    file-print (word od-id "," t "," sig3 "," sun-avoid-path-label ","
       (precision item 2 m3 3) ",,"
       who "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," office-no "," metro-no ","
       (precision item 0 m3 6) "," (precision item 1 m3 3) "," (precision item 3 m3 3) ","
       (precision item 4 m3 6) "," (precision item 5 m3 3) "," (precision item 6 m3 6) "," (heat-class-from-metrics m3) ","
-      t "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," who "," office-no "," metro-no ",maximum shade,"
+      t "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," who "," office-no "," metro-no "," sun-avoid-path-label ","
       (precision item 0 m3 6) "," (precision item 1 m3 3) "," (precision item 2 m3 3) "," (precision item 3 m3 3) ","
-      (precision item 4 m3 6) "," (precision item 5 m3 3) "," (precision item 6 m3 6) "," (heat-class-from-metrics m3) "," personal-walk-speed-mps "," departure-delay-sec "," personal-utci-threshold "," (precision pref-dist 4) "," (precision pref-heat 4) "," (precision pref-shade 4) "," t "," dir "," light "," scenario-id ",maximum shade,"
+      (precision item 4 m3 6) "," (precision item 5 m3 3) "," (precision item 6 m3 6) "," (heat-class-from-metrics m3) ","
+      personal-walk-speed-mps "," departure-delay-sec "," personal-utci-threshold "," (precision pref-dist 4) "," (precision pref-heat 4) "," (precision pref-shade 4) "," t "," dir "," light "," scenario-id "," sun-avoid-path-label ","
       (precision item 0 m3 6) "," (precision item 1 m3 3) "," (precision item 2 m3 3) "," (precision item 3 m3 3) ","
       (precision item 4 m3 6) "," (precision item 5 m3 3) "," (precision item 6 m3 6) "," (heat-class-from-metrics m3) "," )
   ]
@@ -2860,7 +2875,7 @@ to recompute-commuter-3paths
       set shortest-path []
       set min-utci-path []
       set min-shadow-path []
-      set current-path-type "invalid"
+      set current-path-type "无有效路径"
     ] [
       ;; (1) shortest-distance path
       set shortest-path compute-dijkstra commuter-start-node commuter-end-node "link-weight"
