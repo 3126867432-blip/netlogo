@@ -592,15 +592,15 @@ to ensure-comfort-weight-sets
 end
 
 to-report shortest-path-label
-  report "几何最短路径"
+  report "Geometric Shortest Path"
 end
 
 to-report sun-avoid-path-label
-  report "日照规避路径"
+  report "Sun-Avoidance Path"
 end
 
 to-report heat-safe-path-label
-  report "累计热安全路径"
+  report "Cumulative Heat-Safe Path"
 end
 
 
@@ -2639,7 +2639,7 @@ to-report path-signature [path]
 end
 
 to-report csv-active-type [route-family chosen-type]
-  ;; only 累计热安全路径 needs to store the underlying candidate type
+  ;; only Cumulative Heat-Safe Path needs to store the underlying candidate type
   if route-family = heat-safe-path-label [
     if is-string? chosen-type [ report chosen-type ]
   ]
@@ -2689,7 +2689,7 @@ to export-3paths-csv-to-desktop
     let light light-class
     let od-id build-od-id dir metro-no office-no
 
-    ;; 1) 几何最短路径
+    ;; 1) Geometric Shortest Path
     let m1 path-thermal-metrics shortest-path
     let sig1 path-signature shortest-path
     file-print (word od-id "," t "," sig1 "," shortest-path-label ","
@@ -2701,7 +2701,7 @@ to export-3paths-csv-to-desktop
       (precision item 0 m1 6) "," (precision item 1 m1 3) "," (precision item 2 m1 3) "," (precision item 3 m1 3) ","
       (precision item 4 m1 6) "," (precision item 5 m1 3) "," (precision item 6 m1 6) "," (heat-class-from-metrics m1) ",")
 
-    ;; 2) 累计热安全路径
+    ;; 2) Cumulative Heat-Safe Path
     let m2 path-thermal-metrics min-utci-path
     let sig2 path-signature min-utci-path
     let active-type csv-active-type heat-safe-path-label current-path-type
@@ -2717,7 +2717,7 @@ to export-3paths-csv-to-desktop
       (precision item 0 m2 6) "," (precision item 1 m2 3) "," (precision item 2 m2 3) "," (precision item 3 m2 3) ","
       (precision item 4 m2 6) "," (precision item 5 m2 3) "," (precision item 6 m2 6) "," (heat-class-from-metrics m2) "," active-type)
 
-    ;; 3) 日照规避路径
+    ;; 3) Sun-Avoidance Path
     let m3 path-thermal-metrics min-shadow-path
     let sig3 path-signature min-shadow-path
     file-print (word od-id "," t "," sig3 "," sun-avoid-path-label ","
@@ -2875,7 +2875,7 @@ to recompute-commuter-3paths
       set shortest-path []
       set min-utci-path []
       set min-shadow-path []
-      set current-path-type "无有效路径"
+      set current-path-type "No Valid Path"
     ] [
       ;; (1) shortest-distance path
       set shortest-path compute-dijkstra commuter-start-node commuter-end-node "link-weight"
