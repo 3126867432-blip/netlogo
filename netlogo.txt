@@ -159,6 +159,7 @@ commuters-own [
   pref-heat
   pref-shade
   personal-path-type
+  thermal-safety-active-type   ;; underlying rule used by dynamic thermal-safety path
 ]
 
 ; ================== utility functions ==================
@@ -988,6 +989,97 @@ to-report compute-dijkstra [start-node-param end-node-param weight-type]
   report []
 end
 
+
+; ================== dynamic intersection-based routing ==================
+to-report dynamic-route-by-weight [start-n end-n weight-type]
+  ;; Generate a full path through rolling Dijkstra updates at each reached intersection.
+  ;; This represents agents updating route choice based on the current time-slot weights.
+  if (start-n = nobody) or (end-n = nobody) [ report [] ]
+  if start-n = end-n [ report (list start-n) ]
+
+  let current start-n
+  let out (list current)
+  let visited (list current)
+  let max-steps (count nodes * 2)
+  let steps 0
+
+  while [ (current != end-n) and (steps < max-steps) ] [
+    let rem-path compute-dijkstra current end-n weight-type
+    if (not is-list? rem-path) or (length rem-path < 2) [
+      report out
+    ]
+
+    let next-n item 1 rem-path
+
+    ;; Avoid loops. If the rolling rule cycles, append the remaining shortest path and stop.
+    if member? next-n visited [
+      let fallback compute-dijkstra current end-n "link-weight"
+      if (is-list? fallback) and (length fallback >= 2) [
+        foreach but-first fallback [ nd ->
+          if not member? nd out [ set out lput nd out ]
+        ]
+      ]
+      report out
+    ]
+
+    set out lput next-n out
+    set visited lput next-n visited
+    set current next-n
+    set steps steps + 1
+  ]
+
+  report out
+end
+
+to-report dynamic-thermal-safety-path [start-n end-n]
+  ;; At each intersection, agents recompute the remaining thermal-safety path using
+  ;; current UTCI, shadow, discomfort, and detour constraints. Only the next link is
+  ;; committed before the next intersection-level update.
+  if (start-n = nobody) or (end-n = nobody) [ report (list [] "invalid") ]
+  if start-n = end-n [ report (list (list start-n) "dynamic_intersection") ]
+
+  let current start-n
+  let out (list current)
+  let visited (list current)
+  let max-steps (count nodes * 2)
+  let steps 0
+  let used-active? false
+
+  while [ (current != end-n) and (steps < max-steps) ] [
+    let base-rem compute-dijkstra current end-n "link-weight"
+    if (not is-list? base-rem) or (length base-rem < 2) [
+      report (list out "dynamic_incomplete")
+    ]
+
+    let chosen choose-best-comfort-path current end-n base-rem
+    let cand item 0 chosen
+    let cand-type item 1 chosen
+    if cand-type != "shortest" [ set used-active? true ]
+
+    if (not is-list? cand) or (length cand < 2) [ set cand base-rem ]
+    let next-n item 1 cand
+
+    ;; Avoid loops caused by local re-optimization. Fall back to distance shortest route.
+    if member? next-n visited [
+      foreach but-first base-rem [ nd ->
+        if not member? nd out [ set out lput nd out ]
+      ]
+      ifelse used-active?
+        [ report (list out "dynamic_intersection") ]
+        [ report (list out "shortest") ]
+    ]
+
+    set out lput next-n out
+    set visited lput next-n visited
+    set current next-n
+    set steps steps + 1
+  ]
+
+  ifelse used-active?
+    [ report (list out "dynamic_intersection") ]
+    [ report (list out "shortest") ]
+end
+
 ; ==================  ==================
 to setup-time-slots
   ;; 10-minute resolution:
@@ -1163,14 +1255,20 @@ set metro-stations load-dataset-fallback metro-path metro-path-alt "metro-statio
     set shortest-path shortest-path-calc
 
     ; UTCI
-    ; active selection:()
-    let chosen choose-best-comfort-path start-n end-n shortest-path-calc
+    ; dynamic intersection-based thermal-safety routing
+    let chosen dynamic-thermal-safety-path start-n end-n
     let min-utci-path-calc item 0 chosen
     let chosen-type item 1 chosen
     set min-utci-path min-utci-path-calc
+    set thermal-safety-active-type chosen-type
 
-    ; ()
-    let min-shadow-path-calc compute-dijkstra start-n end-n "shadow-cost"
+    ; dynamic intersection-based sun-avoidance routing
+    let min-shadow-path-calc []
+    ifelse daylight? [
+      set min-shadow-path-calc dynamic-route-by-weight start-n end-n "shadow-cost"
+    ] [
+      set min-shadow-path-calc shortest-path-calc
+    ]
     set min-shadow-path min-shadow-path-calc
 
     ;; Let each agent choose one of the three candidate path families using its own preferences
@@ -1648,6 +1746,7 @@ to assign-commuters-to-nearest-metro
         set min-utci-path []
         set min-shadow-path []
         set current-path-type "uncomputed"
+        set thermal-safety-active-type "uncomputed"
         set status "waiting"
 
         ;; store GIS feature references for diagnosis/fallback
@@ -1913,7 +2012,9 @@ to load-current-time-data
     ;; thermal discomfort integral and routing weight (emphasizes hotspots)
     if use-utci? [
       let exceed max (list 0 (avg-utci - utci-discomfort-threshold))
-      set discomfort-excess ((exceed ^ utci-discomfort-power) * link-weight)
+      let severe-exceed max (list 0 (avg-utci - 38))
+      ;; HD32 is represented by exceed; HD38 receives an additional severe-heat penalty.
+      set discomfort-excess (((exceed ^ utci-discomfort-power) + (2 * (severe-exceed ^ utci-discomfort-power))) * link-weight)
 
       ;; increase discomfort penalty for unshaded daytime links (only when shadow effects are enabled)
       ;; continuous sun penalty: intensity = sun-penalty-alpha * sun-factor * (exposure ^ shadow-exposure-gamma)
@@ -2498,7 +2599,10 @@ to-report path-thermal-metrics [path]
         let ex 0
         if use-utci? [
           let exceed max (list 0 (uavg - utci-discomfort-threshold))
-          set ex (exceed ^ utci-discomfort-power) * d
+          let severe-exceed max (list 0 (uavg - 38))
+          ;; Keep path metrics consistent with routing weights: HD32 exposure is represented
+          ;; by exceed, and HD38 exposure receives an additional severe-heat penalty.
+          set ex (((exceed ^ utci-discomfort-power) + (2 * (severe-exceed ^ utci-discomfort-power))) * d)
           ;; ""
            ;; ():keep consistent with update-link-weights
            if use-shadow? and daylight? [
@@ -2691,7 +2795,7 @@ to export-3paths-csv-to-desktop
     ;; 2) active selection (best candidate within budget that significantly reduces discomfort)
     let m2 path-thermal-metrics min-utci-path
     let sig2 path-signature min-utci-path
-    let active-type csv-active-type "min_utci" current-path-type
+    let active-type csv-active-type "min_utci" thermal-safety-active-type
     file-print (word od-id "," t "," sig2 ",min_utci,"
       (precision item 2 m2 3) "," active-type ","
       who "," dir "," light "," scenario-id "," use-shadow? "," use-utci? "," detour-max-effective "," utci-discomfort-threshold "," utci-discomfort-alpha "," utci-discomfort-power "," sun-penalty-alpha "," comfort-discomfort-improve-ratio "," comfort-discomfort-improve-abs "," office-no "," metro-no ","
@@ -2865,14 +2969,15 @@ to recompute-commuter-3paths
       ;; (1) shortest-distance path
       set shortest-path compute-dijkstra commuter-start-node commuter-end-node "link-weight"
 
-      ;; (2) active selection:
-      let chosen choose-best-comfort-path commuter-start-node commuter-end-node shortest-path
+      ;; (2) dynamic intersection-based thermal-safety routing
+      let chosen dynamic-thermal-safety-path commuter-start-node commuter-end-node
       set min-utci-path item 0 chosen
-      set current-path-type item 1 chosen
+      set thermal-safety-active-type item 1 chosen
+      set current-path-type thermal-safety-active-type
 
-      ;; (3) maximum shade:;( 0 )
+      ;; (3) dynamic intersection-based sun-avoidance routing
       ifelse daylight? [
-        set min-shadow-path compute-dijkstra commuter-start-node commuter-end-node "shadow-cost"
+        set min-shadow-path dynamic-route-by-weight commuter-start-node commuter-end-node "shadow-cost"
       ] [
         set min-shadow-path shortest-path
       ]
